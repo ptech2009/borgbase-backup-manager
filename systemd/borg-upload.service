@@ -1,1 +1,14 @@
+[Unit]
+Description=BorgBase Upload Service
+After=network-online.target
+Wants=network-online.target
 
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/borgbase_manager.sh upload
+EnvironmentFile=/etc/borgbase-manager.env
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
