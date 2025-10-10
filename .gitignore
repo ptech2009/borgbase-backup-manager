@@ -1,1 +1,5 @@
-
+.env
+*.log
+*.tmp
+*.pid
+__pycache__/
