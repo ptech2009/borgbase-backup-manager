@@ -186,7 +186,18 @@ setup_borg_env() {
 
 # ====== STATUS ======
 set_status() { echo "$1" > "$STATUS_FILE"; }
-get_status() { [[ -s "$STATUS_FILE" ]] && cat "$STATUS_FILE" || { [[ "${UI_LANG}" == "en" ]] && echo "Initializing status..."; echo "Status wird initialisiert..."; } | tail -n1; }
+get_status() {
+  if [[ -s "$STATUS_FILE" ]]; then
+    tail -n1 "$STATUS_FILE"
+    return 0
+  fi
+
+  if [[ "${UI_LANG}" == "en" ]]; then
+    echo "Initializing status..."
+  else
+    echo "Status wird initialisiert..."
+  fi
+}
 clear_status() { ! is_running && rm -f "$STATUS_FILE"; }
 
 # ====== PROCESS CHECK ======
@@ -473,7 +484,11 @@ show_progress() {
   if ! is_running; then
     say "Kein Vorgang läuft aktuell." "No job is currently running."
     echo ""
-    [[ -f "$STATUS_FILE" ]] && say "Letzter Status: $(cat "$STATUS_FILE")" "Last status: $(cat "$STATUS_FILE")"
+    if [[ -f "$STATUS_FILE" ]]; then
+      local last_status
+      last_status="$(get_status)"
+      say "Letzter Status: ${last_status}" "Last status: ${last_status}"
+    fi
     echo ""
     if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
     else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
