@@ -10,14 +10,13 @@
 #   2) ./.env                         # optional for local testing
 #   3) Runtime environment variables
 #
-# Required variables (defaults/placeholders):
+# Required variables (placeholders / optional):
 #   REPO="ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo"
-#   SSH_KEY="/path/to/id_ed25519"
-#   PASSPHRASE_FILE="/secure/path/passphrase"
-#   SRC_DIR="/mnt/panzerbackup-pm"    # auto-detected if not valid
+#   SSH_KEY=""                         # optional; auto-detected if empty
+#   PASSPHRASE_FILE=""                 # optional; env/agent also fine
+#   SRC_DIR="/mnt/panzerbackup-pm"     # auto-detected if not valid
 #   LOG_FILE="/var/log/borgbase-manager.log"
-#   PRUNE="yes"  # yes|no
-#   KEEP_LAST="1"
+#   PRUNE="yes"  KEEP_LAST="7"
 #
 # Notes:
 #   - No secrets are hardcoded. Provide via env files or unit files.
@@ -29,14 +28,8 @@ trap 'rc=$?; echo "FEHLER in Zeile $LINENO beim Kommando: $BASH_COMMAND (RC=$rc)
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 
 # ====== LOAD ENV ======
-if [[ -r /etc/borgbase-manager.env ]]; then
-  # shellcheck disable=SC1091
-  . /etc/borgbase-manager.env
-fi
-if [[ -r ./.env ]]; then
-  # shellcheck disable=SC1091
-  . ./.env
-fi
+if [[ -r /etc/borgbase-manager.env ]]; then . /etc/borgbase-manager.env; fi
+if [[ -r ./.env ]]; then . ./.env; fi
 
 # ====== DEFAULTS / PLACEHOLDERS ======
 export LC_ALL=C
@@ -44,15 +37,15 @@ export LC_ALL=C
 : "${SRC_DIR:=/mnt/panzerbackup-pm}"
 : "${REPO:=ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo}"
 
-: "${SSH_KEY:=/path/to/id_ed25519}"
-: "${PASSPHRASE_FILE:=/secure/path/passphrase}"
+: "${SSH_KEY:=}"             # will be auto-detected if empty
+: "${PASSPHRASE_FILE:=}"     # optional
 
 : "${LOG_FILE:=/var/log/borgbase-manager.log}"
 : "${STATUS_FILE:=/tmp/borg-status}"
 : "${PID_FILE:=/tmp/borg-upload.pid}"
 
 : "${PRUNE:=yes}"
-: "${KEEP_LAST:=1}"
+: "${KEEP_LAST:=7}"
 
 # ====== I18N: Language selection & helpers ======
 choose_language() {
@@ -89,25 +82,75 @@ prompt_yes_no() {
   fi
 }
 
-# ====== LOGGING ======
-log_start() {
-  local dir
-  dir="$(dirname -- "$LOG_FILE")"
-  [[ -d "$dir" ]] || mkdir -p "$dir"
-  exec > >(tee -a "$LOG_FILE") 2>&1
-  echo "=========================================="
-  echo "Start: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "=========================================="
-}
-log_end() {
-  echo "=========================================="
-  echo "Ende:  $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "=========================================="
-  echo ""
+# ===== SSH KEY AUTODETECT =====
+_host_from_repo() { local r="$1"; r="${r#ssh://}"; r="${r%%/*}"; echo "${r#*@}"; }
+
+_collect_keys_in_dir() {
+  local d="$1"; [[ -d "$d" ]] || return 0
+  shopt -s nullglob
+  for f in "$d"/id_ed25519 "$d"/id_rsa "$d"/id_*; do
+    [[ -f "$f" && "${f##*.}" != "pub" ]] && echo "$f"
+  done
+  shopt -u nullglob
 }
 
-# ====== AUTO-DETECTION (case-insensitive substring '*panzerbackup*') ======
-# Scans common mount roots, including user-specific media mounts (/media/*/*, /run/media/*/*)
+_keys_from_ssh_config() {
+  local cfg="$1" host="$2" homebase="$3"; [[ -f "$cfg" ]] || return 0
+  awk -v H="$host" '
+    BEGIN{IGNORECASE=1; inhost=0}
+    tolower($1)=="host" { inhost=0; for(i=2;i<=NF;i++) if ($i=="*" || tolower($i)==tolower(H)) inhost=1; next }
+    inhost && tolower($1)=="identityfile" { for(i=2;i<=NF;i++) print $i }
+  ' "$cfg" \
+  | sed -e 's/"//g' -e "s/'//g" \
+  | while read -r p; do
+      case "$p" in
+        "~/"*) echo "${homebase}${p#\~}" ;;
+        *)     echo "$p" ;;
+      esac
+    done
+}
+
+autodetect_ssh_key() {
+  local host keys=() k; host="$(_host_from_repo "$REPO")"
+
+  # 1) explicit env path?
+  if [[ -n "${SSH_KEY:-}" && -r "$SSH_KEY" ]]; then
+    echo "$SSH_KEY"; return 0
+  fi
+
+  # 2) IdentityFile from ssh configs (current user + SUDO_USER)
+  mapfile -t keys < <(_keys_from_ssh_config "$HOME/.ssh/config" "$host" "$HOME")
+  if [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]]; then
+    mapfile -t k < <(_keys_from_ssh_config "/home/$SUDO_USER/.ssh/config" "$host" "/home/$SUDO_USER"); keys+=("${k[@]}")
+  fi
+
+  # 3) conventional file names in common dirs
+  keys+=($(_collect_keys_in_dir "$HOME/.ssh"))
+  [[ $EUID -eq 0 ]] && keys+=($(_collect_keys_in_dir "/root/.ssh"))
+  if [[ $EUID -eq 0 && -n ${SUDO_USER:-} && -d "/home/$SUDO_USER/.ssh" ]]; then
+    keys+=($(_collect_keys_in_dir "/home/$SUDO_USER/.ssh"))
+  fi
+
+  # 4) if root without SUDO_USER → scan all regular user homes
+  if [[ $EUID -eq 0 && -z "${SUDO_USER:-}" ]]; then
+    while IFS=: read -r name _ uid _ _ home _; do
+      [[ $uid -ge 1000 && -d "$home/.ssh" ]] || continue
+      keys+=($(_collect_keys_in_dir "$home/.ssh"))
+    done < /etc/passwd
+  fi
+
+  # de-dup
+  if ((${#keys[@]})); then
+    mapfile -t keys < <(printf '%s\n' "${keys[@]}" | awk '!seen[$0]++')
+  fi
+
+  # prefer ed25519
+  for k in "${keys[@]}"; do [[ -r "$k" && "$k" == *ed25519* ]] && { echo "$k"; return 0; }; done
+  for k in "${keys[@]}"; do [[ -r "$k" ]] && { echo "$k"; return 0; }; done
+  return 1
+}
+
+# ====== AUTO-DETECTION of SRC_DIR (case-insensitive '*panzerbackup*') ======
 detect_src_dir() {
   has_upload_set() {
     shopt -s nullglob
@@ -128,40 +171,27 @@ detect_src_dir() {
 
   for base in "${bases[@]}"; do
     [[ -d "$base" ]] || continue
-    # case-insensitive substring match: *panzerbackup*, depth-limited for speed
-    while IFS= read -r -d '' d; do
-      candidates+=( "$d" )
-    done < <(find "$base" -maxdepth 3 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
+    while IFS= read -r -d '' d; do candidates+=( "$d" ); done \
+      < <(find "$base" -maxdepth 3 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
   done
 
-  # Additionally inspect mounted targets for substring 'panzerbackup'
   if command -v findmnt >/dev/null 2>&1; then
-    while IFS= read -r mnt; do
-      [[ -d "$mnt" ]] && candidates+=( "$mnt" )
-    done < <(findmnt -rno TARGET | awk 'BEGIN{IGNORECASE=1}/panzerbackup/{print}')
+    while IFS= read -r mnt; do [[ -d "$mnt" ]] && candidates+=( "$mnt" ); done \
+      < <(findmnt -rno TARGET | awk 'BEGIN{IGNORECASE=1}/panzerbackup/{print}')
   fi
 
-  # De-duplicate
-  if (( ${#candidates[@]} )); then
-    mapfile -t candidates < <(printf "%s\n" "${candidates[@]}" | awk '!seen[$0]++')
-  fi
+  (( ${#candidates[@]} )) && mapfile -t candidates < <(printf "%s\n" "${candidates[@]}" | awk '!seen[$0]++')
 
-  # Keep only directories containing a valid upload set
   local valid=()
-  for d in "${candidates[@]}"; do
-    has_upload_set "$d" && valid+=( "$d" )
-  done
-
+  for d in "${candidates[@]:-}"; do has_upload_set "$d" && valid+=( "$d" ); done
   (( ${#valid[@]} )) || { say "Kein Verzeichnis mit panzer_*.img.zst.gpg gefunden." "No directory containing panzer_*.img.zst.gpg found."; return 1; }
 
-  # Pick the directory with the newest artifact
-  local best_dir="" best_mtime=0
+  local best_dir="" best_mtime=0 newest mt
   for d in "${valid[@]}"; do
-    local newest mt
-    newest="$(ls -1t "$d"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
+    newest="$(ls -1t "$d"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)" || true
     [[ -n "$newest" ]] || continue
     mt=$(stat -c %Y "$newest" 2>/dev/null || echo 0)
-    (( mt > best_mtime )) && { best_mtime=$mt; best_dir="$d" ;}
+    (( mt > best_mtime )) && { best_mtime=$mt; best_dir="$d"; }
   done
 
   [[ -n "$best_dir" ]] || { say "Kein passendes Backup-Verzeichnis gefunden." "No suitable backup directory found."; return 1; }
@@ -171,14 +201,32 @@ detect_src_dir() {
 
 # ====== BORG ENV SETUP ======
 setup_borg_env() {
-  if [[ -n "${SSH_KEY:-}" && -r "$SSH_KEY" ]]; then
+  # SSH key: detect if not specified
+  local key
+  key="$(autodetect_ssh_key || true)"
+
+  if [[ -n "$key" && -r "$key" ]]; then
+    SSH_KEY="$key"
     export BORG_RSH="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes"
+    say "SSH-Schlüssel verwendet: $SSH_KEY" "Using SSH key: $SSH_KEY"
   else
-    export BORG_RSH="ssh -o IdentitiesOnly=no"
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+      export BORG_RSH="ssh -o IdentitiesOnly=no"
+      say "Kein Key-Dateipfad gefunden – nutze SSH-Agent." \
+          "No key file found — using SSH agent."
+    else
+      export BORG_RSH="ssh"
+      say "WARNUNG: Kein SSH-Key gefunden. Es werden Standardidentitäten versucht." \
+          "WARNING: No SSH key found. Falling back to default identities."
+    fi
   fi
-  if [[ -f "$PASSPHRASE_FILE" ]]; then
-    export BORG_PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
+
+  # Borg passphrase (optional)
+  if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
+    export BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
   fi
+
+  # Log file prep
   local dir; dir="$(dirname -- "$LOG_FILE")"
   [[ -d "$dir" ]] || mkdir -p "$dir"
   [[ -e "$LOG_FILE" ]] || : > "$LOG_FILE"
@@ -189,13 +237,8 @@ set_status() { echo "$1" > "$STATUS_FILE"; }
 get_status() {
   if [[ -s "$STATUS_FILE" ]]; then
     tail -n1 "$STATUS_FILE"
-    return 0
-  fi
-
-  if [[ "${UI_LANG}" == "en" ]]; then
-    echo "Initializing status..."
   else
-    echo "Status wird initialisiert..."
+    if [[ "${UI_LANG}" == "en" ]]; then echo "Initializing status..."; else echo "Status wird initialisiert..."; fi
   fi
 }
 clear_status() { ! is_running && rm -f "$STATUS_FILE"; }
@@ -270,9 +313,7 @@ select_archive() {
   mapfile -t archives < <(borg list --short "${REPO}")
   (( ${#archives[@]} )) || { say "Keine Archive im Repository gefunden." "No archives found in repository."; exit 1; }
   say "Verfügbare Archive:" "Available archives:"
-  for i in "${!archives[@]}"; do
-    printf "  %2d) %s\n" $((i+1)) "${archives[$i]}"
-  done
+  for i in "${!archives[@]}"; do printf "  %2d) %s\n" $((i+1)) "${archives[$i]}"; done
   echo ""
   if [[ "${UI_LANG}" == "en" ]]; then
     read -rp "Archive number (1-${#archives[@]}): " choice || { echo "Input aborted."; exit 1; }
@@ -303,9 +344,8 @@ else
   export BORG_RSH="ssh -o IdentitiesOnly=no"
 fi
 
-[[ -f "$PASSPHRASE_FILE" ]] && export BORG_PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
+[[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]] && export BORG_PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
 set_status() { echo "$1" > "$STATUS_FILE"; }
-
 say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
 
 {
@@ -336,13 +376,19 @@ say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
   } > "$INCLUDE_LIST"
 
   set_status "UPLOAD: Lade Daten hoch..."
-  borg create --stats --progress --compression lz4 "${REPO}::${ARCHIVE}" --paths-from-stdin < "$INCLUDE_LIST"
+  if ! borg create --stats --progress --compression lz4 "${REPO}::${ARCHIVE}" --paths-from-stdin < "$INCLUDE_LIST"; then
+    rc=$?
+    set_status "FEHLER: Upload fehlgeschlagen (rc=${rc}). Siehe Log."
+    echo "Upload failed with rc=${rc}"
+    rm -f "$PID_FILE"
+    exit $rc
+  fi
 
   if [[ "${PRUNE}" == "yes" ]]; then
     set_status "UPLOAD: Lösche alte Archive..."
-    borg prune -v --list "${REPO}" --glob-archives "Backup-${HOST}-*" --keep-last="${KEEP_LAST}"
+    borg prune -v --list "${REPO}" --glob-archives "Backup-${HOST}-*" --keep-last="${KEEP_LAST}" || true
     set_status "UPLOAD: Komprimiere Repository..."
-    borg compact "${REPO}"
+    borg compact "${REPO}" || true
   fi
 
   set_status "UPLOAD: Abgeschlossen - ${ARCHIVE}"
@@ -357,7 +403,7 @@ EOFWORKER
   env -i \
     PATH="$PATH" LC_ALL="$LC_ALL" UI_LANG="${UI_LANG:-de}" \
     SRC_DIR="$SRC_DIR" REPO="$REPO" \
-    SSH_KEY="$SSH_KEY" PASSPHRASE_FILE="$PASSPHRASE_FILE" \
+    SSH_KEY="$SSH_KEY" PASSPHRASE_FILE="${PASSPHRASE_FILE:-}" \
     LOG_FILE="$LOG_FILE" STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
     PRUNE="$PRUNE" KEEP_LAST="$KEEP_LAST" \
     nohup setsid /tmp/borg-upload-worker.sh &> /dev/null &
@@ -384,7 +430,7 @@ else
   export BORG_RSH="ssh -o IdentitiesOnly=no"
 fi
 
-[[ -f "$PASSPHRASE_FILE" ]] && export BORG_PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
+[[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]] && export BORG_PASSPHRASE="$(cat "$PASSPHRASE_FILE")"
 set_status() { echo "$1" > "$STATUS_FILE"; }
 say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
 
@@ -400,7 +446,13 @@ say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
 
   set_status "DOWNLOAD: Extrahiere ${SELECTED_ARCHIVE}..."
   cd "$SRC_DIR"
-  borg extract --progress "${REPO}::${SELECTED_ARCHIVE}"
+  if ! borg extract --progress "${REPO}::${SELECTED_ARCHIVE}"; then
+    rc=$?
+    set_status "FEHLER: Download fehlgeschlagen (rc=${rc}). Siehe Log."
+    echo "Download failed with rc=${rc}"
+    rm -f "$PID_FILE"
+    exit $rc
+  fi
 
   set_status "DOWNLOAD: Abgeschlossen - ${SELECTED_ARCHIVE}"
   echo "=========================================="
@@ -414,7 +466,7 @@ EOFWORKER
   env -i \
     PATH="$PATH" LC_ALL="$LC_ALL" UI_LANG="${UI_LANG:-de}" \
     SELECTED_ARCHIVE="$selected_archive" SRC_DIR="$SRC_DIR" \
-    REPO="$REPO" SSH_KEY="$SSH_KEY" PASSPHRASE_FILE="$PASSPHRASE_FILE" \
+    REPO="$REPO" SSH_KEY="$SSH_KEY" PASSPHRASE_FILE="${PASSPHRASE_FILE:-}" \
     LOG_FILE="$LOG_FILE" STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
     nohup setsid /tmp/borg-download-worker.sh &> /dev/null &
 
@@ -485,12 +537,11 @@ show_progress() {
     say "Kein Vorgang läuft aktuell." "No job is currently running."
     echo ""
     if [[ -f "$STATUS_FILE" ]]; then
-      local last_status
-      last_status="$(get_status)"
+      local last_status; last_status="$(get_status)"
       say "Letzter Status: ${last_status}" "Last status: ${last_status}"
     fi
     echo ""
-    if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
+    if [[ "${UI_LANG}" == "en" ]] ; then read -rp "Press Enter to return..." _ || true
     else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
     return 0
   fi
@@ -518,7 +569,7 @@ show_progress() {
       /^Worker Start \((Upload|Download)\):/ { last=NR }
       END{
         if (NR==0) exit
-        start=(last>0?(last>1?last-1:last):(NR>50?NR-49:1))
+        start=(last>0?(last>1?last-1:last):(NR>80?NR-79:1))
         for (i=start;i<=NR;i++) print lines[i]
       }
     ' "$LOG_FILE"
@@ -556,6 +607,26 @@ show_progress() {
   say "Finaler Status: $(get_status)" "Final status: $(get_status)"
   echo "=========================================="
   echo ""
+  if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
+  else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
+}
+
+# ====== VIEW LOG ======
+view_log() {
+  { clear 2>/dev/null || printf '\033c'; } || true
+  echo "=========================================="
+  say "                 Log-Ansicht" "                 Log viewer"
+  echo "=========================================="
+  echo ""
+  if [[ ! -f "$LOG_FILE" ]]; then
+    say "Kein Logfile gefunden: $LOG_FILE" "No log file found: $LOG_FILE"
+  else
+    say "Zeige die letzten 200 Zeilen von:" "Showing last 200 lines of:"
+    echo "  $LOG_FILE"
+    echo "------------------------------------------"
+    tail -n 200 "$LOG_FILE"
+  fi
+  echo "------------------------------------------"
   if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
   else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
 }
@@ -646,7 +717,11 @@ show_menu() {
   echo "╚═══════════════════════════════════════════════╝"
   echo ""
   echo "Repository: ${REPO}"
-  echo "Lokal:      ${SRC_DIR}"
+  if [[ "${UI_LANG}" == "en" ]]; then
+    echo "Local:      ${SRC_DIR}"
+  else
+    echo "Lokal:      ${SRC_DIR}"
+  fi
   echo ""
   if is_running; then
     say "STATUS: Vorgang läuft!" "STATUS: Job running!"
@@ -663,7 +738,8 @@ show_menu() {
   say "5) Delete   - Archiv löschen"                    "5) Delete   - Delete archive"
   say "6) Stop     - Laufenden Vorgang abbrechen"       "6) Stop     - Stop running job"
   say "7) Progress - Fortschritt anzeigen (Live)"       "7) Progress - Show live progress"
-  say "8) Exit"                                        "8) Exit"
+  say "8) Log      - Logfile anzeigen"                  "8) Log      - View log file"
+  say "9) Exit"                                        "9) Exit"
   echo ""
 }
 
@@ -681,8 +757,9 @@ if [[ $# -gt 0 ]]; then
     info)     do_info ;;
     delete)   shift; borg delete "${REPO}::${1:?ARCHIV angeben / specify ARCHIVE}" && borg compact "${REPO}" ;;
     stop)     do_stop ;;
-    *) say "Verwendung: $0 [upload|download ARCHIV|list|info|delete ARCHIV|stop]" \
-           "Usage: $0 [upload|download ARCHIVE|list|info|delete ARCHIVE|stop]"; exit 1 ;;
+    log)      view_log ;;
+    *) say "Verwendung: $0 [upload|download ARCHIVE|list|info|delete ARCHIVE|stop|log]" \
+           "Usage: $0 [upload|download ARCHIVE|list|info|delete ARCHIVE|stop|log]"; exit 1 ;;
   esac
   exit 0
 fi
@@ -691,9 +768,9 @@ fi
 while true; do
   show_menu
   if [[ "${UI_LANG}" == "en" ]]; then
-    if ! read -rp "Choice (1-8): " choice; then echo "No input (EOF) — exiting."; exit 0; fi
+    if ! read -rp "Choice (1-9): " choice; then echo "No input (EOF) — exiting."; exit 0; fi
   else
-    if ! read -rp "Auswahl (1-8): " choice; then echo "Keine Eingabe erkannt (EOF) – beende."; exit 0; fi
+    if ! read -rp "Auswahl (1-9): " choice; then echo "Keine Eingabe erkannt (EOF) – beende."; exit 0; fi
   fi
   case "${choice:-}" in
     1) do_upload;   if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to continue..." _ || true; else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
@@ -703,7 +780,8 @@ while true; do
     5) { clear 2>/dev/null || printf '\033c'; } || true; do_delete; if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to continue..." _ || true; else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
     6) do_stop;     if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to continue..." _ || true; else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
     7) show_progress ;;
-    8) if [[ "${UI_LANG}" == "en" ]]; then echo "Goodbye!"; else echo "Auf Wiedersehen!"; fi; exit 0 ;;
+    8) view_log ;;
+    9) if [[ "${UI_LANG}" == "en" ]]; then echo "Goodbye!"; else echo "Auf Wiedersehen!"; fi; exit 0 ;;
     *) if [[ "${UI_LANG}" == "en" ]]; then echo "Invalid selection"; else echo "Ungültige Auswahl"; fi; sleep 1 ;;
   esac
 done
