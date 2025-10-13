@@ -10,8 +10,10 @@ A secure, production-ready backup management tool for uploading and downloading 
 
 - **🌐 Bilingual Interface**: Full support for English and German
 - **🔒 Security First**: No hardcoded secrets, SSH key authentication, GPG-encrypted backups
+- **🔑 Smart SSH Key Detection**: Automatic discovery of SSH keys from multiple sources
 - **🔄 Automated Workflows**: systemd-friendly for scheduled backups
 - **📊 Live Progress Monitoring**: Real-time status updates during backup operations
+- **📝 Integrated Log Viewer**: View log files directly from the menu
 - **🎯 Smart Auto-Detection**: Automatically finds Panzerbackup volumes
 - **🖥️ Interactive TUI**: User-friendly menu-driven interface
 - **⚙️ CLI Support**: Direct command-line operations for automation
@@ -58,8 +60,8 @@ Create `/etc/borgbase-manager.env` with your settings:
 # BorgBase Repository
 REPO="ssh://your_user@your_user.repo.borgbase.com/./repo"
 
-# Authentication
-SSH_KEY="/path/to/your/id_ed25519"
+# Authentication (SSH key is auto-detected if not specified)
+SSH_KEY="/path/to/your/id_ed25519"  # Optional - will be auto-detected
 PASSPHRASE_FILE="/secure/path/to/passphrase"
 
 # Backup Source (auto-detected if mounted)
@@ -97,6 +99,7 @@ sudo chmod 400 /secure/path/to/passphrase
 # CLI mode
 ./borgbase_manager.sh upload
 ./borgbase_manager.sh list
+./borgbase_manager.sh log
 ```
 
 ## 📖 Usage
@@ -118,7 +121,8 @@ Run the script without arguments to access the interactive menu:
 5. **Delete** - Remove an archive from repository
 6. **Stop** - Cancel running operation
 7. **Progress** - Live progress monitoring
-8. **Exit** - Quit the manager
+8. **Log** - View log file (last 200 lines)
+9. **Exit** - Quit the manager
 
 ### Command-Line Interface
 
@@ -140,7 +144,45 @@ Run the script without arguments to access the interactive menu:
 
 # Stop running operation
 ./borgbase_manager.sh stop
+
+# View log file
+./borgbase_manager.sh log
 ```
+
+## 🔑 SSH Key Auto-Detection
+
+The script automatically detects SSH keys in the following order:
+
+1. **Environment Variable**: `SSH_KEY` from configuration file
+2. **SSH Config File**: `IdentityFile` entries matching the repository host
+   - `~/.ssh/config` (current user)
+   - `/home/$SUDO_USER/.ssh/config` (when running as root via sudo)
+3. **Standard Key Locations**: Common SSH key filenames in:
+   - `~/.ssh/` (current user)
+   - `/root/.ssh/` (when running as root)
+   - `/home/$SUDO_USER/.ssh/` (when running as root via sudo)
+
+**Priority:**
+- Ed25519 keys are preferred over RSA keys
+- If no key file is found, the script falls back to SSH agent or default SSH behavior
+
+**Supported Key Types:**
+- `id_ed25519` (preferred)
+- `id_rsa`
+- `id_ecdsa`
+- `id_dsa`
+- Any custom key filename
+
+**Example SSH Config:**
+
+```ssh-config
+# ~/.ssh/config
+Host *.repo.borgbase.com
+    IdentityFile ~/.ssh/id_ed25519_borgbase
+    IdentitiesOnly yes
+```
+
+The script will automatically use `id_ed25519_borgbase` when connecting to BorgBase.
 
 ## ⚙️ systemd Integration
 
@@ -203,16 +245,19 @@ sudo systemctl list-timers borgbase-upload.timer
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `REPO` | BorgBase repository URL | *Required* |
-| `SSH_KEY` | Path to SSH private key | *Required* |
-| `PASSPHRASE_FILE` | Path to Borg passphrase | *Required* |
-| `SRC_DIR` | Backup source directory | `/mnt/panzerbackup-pm` |
-| `LOG_FILE` | Log file location | `/var/log/borgbase-manager.log` |
-| `PRUNE` | Enable auto-pruning | `yes` |
-| `KEEP_LAST` | Number of backups to retain | `7` |
-| `UI_LANG` | Interface language (de/en) | `de` |
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `REPO` | BorgBase repository URL | - | ✅ Yes |
+| `SSH_KEY` | Path to SSH private key | Auto-detected | ❌ No |
+| `PASSPHRASE_FILE` | Path to Borg passphrase | - | ❌ No* |
+| `SRC_DIR` | Backup source directory | `/mnt/panzerbackup-pm` | ❌ No** |
+| `LOG_FILE` | Log file location | `/var/log/borgbase-manager.log` | ❌ No |
+| `PRUNE` | Enable auto-pruning | `yes` | ❌ No |
+| `KEEP_LAST` | Number of backups to retain | `7` | ❌ No |
+| `UI_LANG` | Interface language (de/en) | `de` | ❌ No |
+
+\* If not specified, passphrase must be provided via `BORG_PASSPHRASE` environment variable or SSH agent  
+\** Auto-detected if Panzerbackup volume is mounted
 
 ### Configuration Priority
 
@@ -237,14 +282,26 @@ The manager handles complete Panzerbackup sets:
 
 ## 🔍 Auto-Detection
 
+### Backup Directory Detection
+
 The script automatically searches for Panzerbackup volumes in:
 
 - `/mnt/*panzerbackup*`
 - `/media/*/*panzerbackup*`
 - `/run/media/*/*panzerbackup*`
-- Any mounted filesystem with "panzerbackup" in the path
+- Any mounted filesystem with "panzerbackup" in the path (via `findmnt`)
 
 Detection prioritizes the directory with the newest backup artifacts.
+
+### SSH Key Detection
+
+SSH keys are automatically detected from:
+
+1. Configuration files (`SSH_KEY` variable)
+2. SSH config files (`~/.ssh/config`)
+3. Standard SSH key directories (`~/.ssh/`, `/root/.ssh/`)
+
+Ed25519 keys are preferred for enhanced security.
 
 ## 📊 Monitoring
 
@@ -257,6 +314,20 @@ Option 7 in the interactive menu provides real-time monitoring:
 - Automatic refresh every 2 seconds
 - Non-intrusive (CTRL+C to exit monitoring without stopping the job)
 
+### Log Viewer
+
+Option 8 in the interactive menu displays:
+
+- Last 200 lines of the log file
+- Full path to log file
+- Formatted output for easy reading
+
+Access via CLI:
+
+```bash
+./borgbase_manager.sh log
+```
+
 ### Log Files
 
 ```bash
@@ -265,17 +336,22 @@ sudo tail -f /var/log/borgbase-manager.log
 
 # Check systemd journal
 sudo journalctl -u borgbase-upload.service -f
+
+# View last 200 lines (via script)
+./borgbase_manager.sh log
 ```
 
 ## 🛡️ Security Features
 
 - ✅ No secrets in script code
 - ✅ SSH key-based authentication
+- ✅ Intelligent SSH key auto-detection
 - ✅ Encrypted repository passphrases
 - ✅ GPG-encrypted backup images
 - ✅ Workers run with minimal environment (`env -i`)
 - ✅ Secure file permissions enforcement
 - ✅ Lock file protection against concurrent operations
+- ✅ SSH agent support as fallback
 
 ## 🐛 Troubleshooting
 
@@ -284,6 +360,21 @@ sudo journalctl -u borgbase-upload.service -f
 ```bash
 # If a job was interrupted, manually break lock
 borg break-lock ssh://user@repo.borgbase.com/./repo
+```
+
+### SSH Key Not Found
+
+The script will automatically detect SSH keys. If detection fails:
+
+```bash
+# Explicitly specify SSH key in config
+export SSH_KEY="/path/to/your/key"
+
+# Or add to /etc/borgbase-manager.env
+echo 'SSH_KEY="/path/to/your/key"' | sudo tee -a /etc/borgbase-manager.env
+
+# Check which key would be used
+ssh -v user@user.repo.borgbase.com
 ```
 
 ### Auto-Detection Fails
@@ -301,6 +392,19 @@ export SRC_DIR="/path/to/your/backup"
 sudo chown -R root:root /etc/borgbase-manager.env
 sudo chmod 600 /etc/borgbase-manager.env
 sudo chmod 400 /secure/path/to/passphrase
+
+# Check SSH key permissions
+chmod 600 ~/.ssh/id_ed25519
+```
+
+### View Logs
+
+```bash
+# Use built-in log viewer
+./borgbase_manager.sh log
+
+# Or view directly
+sudo tail -f /var/log/borgbase-manager.log
 ```
 
 ## 📝 License
