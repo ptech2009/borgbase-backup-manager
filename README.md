@@ -10,14 +10,15 @@ A secure, production-ready backup management tool for uploading and downloading 
 
 - **🌐 Bilingual Interface**: Full support for English and German
 - **🔒 Security First**: No hardcoded secrets, SSH key authentication, GPG-encrypted backups
-- **🔑 Smart SSH Key Detection**: Automatic discovery of SSH keys from multiple sources
+- **🔑 Advanced SSH Key Detection**: Automatic discovery from SSH config files, standard locations, and all system users
 - **🔄 Automated Workflows**: systemd-friendly for scheduled backups
-- **📊 Live Progress Monitoring**: Real-time status updates during backup operations
+- **📊 Live Progress Monitoring**: Real-time status updates with filtered, readable log output
 - **📝 Integrated Log Viewer**: View log files directly from the menu
-- **🎯 Smart Auto-Detection**: Automatically finds Panzerbackup volumes
+- **🎯 Smart Auto-Detection**: Automatically finds Panzerbackup volumes across multiple mount points
 - **🖥️ Interactive TUI**: User-friendly menu-driven interface
 - **⚙️ CLI Support**: Direct command-line operations for automation
 - **🧹 Automatic Pruning**: Configurable retention policies with compact operation
+- **🛡️ Robust Error Handling**: Comprehensive error trapping and status reporting
 
 ## 📋 Prerequisites
 
@@ -57,18 +58,20 @@ chmod +x borgbase_manager.sh
 Create `/etc/borgbase-manager.env` with your settings:
 
 ```bash
-# BorgBase Repository
+# BorgBase Repository (REQUIRED)
 REPO="ssh://your_user@your_user.repo.borgbase.com/./repo"
 
 # Authentication (SSH key is auto-detected if not specified)
 SSH_KEY="/path/to/your/id_ed25519"  # Optional - will be auto-detected
-PASSPHRASE_FILE="/secure/path/to/passphrase"
+PASSPHRASE_FILE="/secure/path/to/passphrase"  # Optional - can use BORG_PASSPHRASE or SSH agent
 
 # Backup Source (auto-detected if mounted)
 SRC_DIR="/mnt/panzerbackup-pm"
 
 # Logging
 LOG_FILE="/var/log/borgbase-manager.log"
+STATUS_FILE="/tmp/borg-status"
+PID_FILE="/tmp/borg-upload.pid"
 
 # Retention Policy
 PRUNE="yes"
@@ -120,7 +123,7 @@ Run the script without arguments to access the interactive menu:
 4. **Info** - Display repository information
 5. **Delete** - Remove an archive from repository
 6. **Stop** - Cancel running operation
-7. **Progress** - Live progress monitoring
+7. **Progress** - Live progress monitoring with filtered output
 8. **Log** - View log file (last 200 lines)
 9. **Exit** - Quit the manager
 
@@ -151,20 +154,28 @@ Run the script without arguments to access the interactive menu:
 
 ## 🔑 SSH Key Auto-Detection
 
-The script automatically detects SSH keys in the following order:
+The script features **comprehensive SSH key auto-detection** that searches multiple locations in the following priority order:
+
+### Detection Priority
 
 1. **Environment Variable**: `SSH_KEY` from configuration file
-2. **SSH Config File**: `IdentityFile` entries matching the repository host
+2. **SSH Config Files**: `IdentityFile` entries matching the repository host
    - `~/.ssh/config` (current user)
+   - `/etc/ssh/ssh_config` (system-wide)
    - `/home/$SUDO_USER/.ssh/config` (when running as root via sudo)
 3. **Standard Key Locations**: Common SSH key filenames in:
    - `~/.ssh/` (current user)
    - `/root/.ssh/` (when running as root)
    - `/home/$SUDO_USER/.ssh/` (when running as root via sudo)
+4. **All System Users**: When running as root, searches all regular users (UID ≥ 1000):
+   - `~/.ssh/` directories
+   - User-specific SSH config files
 
-**Priority:**
-- Ed25519 keys are preferred over RSA keys
-- If no key file is found, the script falls back to SSH agent or default SSH behavior
+**Key Preferences:**
+- Ed25519 keys are preferred over RSA/ECDSA/DSA keys for enhanced security
+- Keys must be readable by the current user
+- Duplicate paths are automatically filtered
+- If no key file is found, falls back to SSH agent or default SSH behavior
 
 **Supported Key Types:**
 - `id_ed25519` (preferred)
@@ -182,7 +193,36 @@ Host *.repo.borgbase.com
     IdentitiesOnly yes
 ```
 
-The script will automatically use `id_ed25519_borgbase` when connecting to BorgBase.
+The script will automatically detect and use `id_ed25519_borgbase` when connecting to BorgBase.
+
+## 🎯 Auto-Detection Features
+
+### Backup Directory Detection
+
+The script automatically searches for Panzerbackup volumes in:
+
+- `/mnt/*panzerbackup*` (case-insensitive)
+- `/media/*/*panzerbackup*` (case-insensitive)
+- `/run/media/*/*panzerbackup*` (case-insensitive)
+- Any mounted filesystem with "panzerbackup" in the path (via `findmnt`)
+
+**Selection Logic:**
+- Only directories containing valid `panzer_*.img.zst.gpg` files are considered
+- If multiple valid directories exist, the one with the **newest backup** is selected
+- Directories are searched up to 3 levels deep
+
+### Preflight Validation
+
+Before starting an upload, the script performs comprehensive validation:
+
+- Verifies presence of latest backup image (`.img.zst.gpg`)
+- Checks for required companion files (`.sha256`, `.sfdisk`)
+- Calculates total upload size including:
+  - Main backup image
+  - SHA256 checksum
+  - Partition table (sfdisk)
+  - `LATEST_OK` symlinks
+  - `panzerbackup.log`
 
 ## ⚙️ systemd Integration
 
@@ -252,6 +292,8 @@ sudo systemctl list-timers borgbase-upload.timer
 | `PASSPHRASE_FILE` | Path to Borg passphrase | - | ❌ No* |
 | `SRC_DIR` | Backup source directory | `/mnt/panzerbackup-pm` | ❌ No** |
 | `LOG_FILE` | Log file location | `/var/log/borgbase-manager.log` | ❌ No |
+| `STATUS_FILE` | Status tracking file | `/tmp/borg-status` | ❌ No |
+| `PID_FILE` | Process ID file | `/tmp/borg-upload.pid` | ❌ No |
 | `PRUNE` | Enable auto-pruning | `yes` | ❌ No |
 | `KEEP_LAST` | Number of backups to retain | `7` | ❌ No |
 | `UI_LANG` | Interface language (de/en) | `de` | ❌ No |
@@ -261,8 +303,8 @@ sudo systemctl list-timers borgbase-upload.timer
 
 ### Configuration Priority
 
-1. `/etc/borgbase-manager.env` (recommended)
-2. `./.env` (local override)
+1. `/etc/borgbase-manager.env` (recommended for production)
+2. `./.env` (local override for testing)
 3. Runtime environment variables
 
 ## 🗂️ Backup Structure
@@ -280,39 +322,27 @@ The manager handles complete Panzerbackup sets:
 └── panzerbackup.log                            # Backup log
 ```
 
-## 🔍 Auto-Detection
+### Archive Naming Convention
 
-### Backup Directory Detection
+Archives are named using the pattern: `Backup-<HOSTNAME>-<TIMESTAMP>`
 
-The script automatically searches for Panzerbackup volumes in:
-
-- `/mnt/*panzerbackup*`
-- `/media/*/*panzerbackup*`
-- `/run/media/*/*panzerbackup*`
-- Any mounted filesystem with "panzerbackup" in the path (via `findmnt`)
-
-Detection prioritizes the directory with the newest backup artifacts.
-
-### SSH Key Detection
-
-SSH keys are automatically detected from:
-
-1. Configuration files (`SSH_KEY` variable)
-2. SSH config files (`~/.ssh/config`)
-3. Standard SSH key directories (`~/.ssh/`, `/root/.ssh/`)
-
-Ed25519 keys are preferred for enhanced security.
+Example: `Backup-myserver-2025-01-15_14-30`
 
 ## 📊 Monitoring
 
 ### Live Progress
 
-Option 7 in the interactive menu provides real-time monitoring:
+Option 7 in the interactive menu provides real-time monitoring with:
 
-- Current operation status
-- Live log streaming
-- Automatic refresh every 2 seconds
-- Non-intrusive (CTRL+C to exit monitoring without stopping the job)
+- **Current operation status** from status file
+- **Filtered log streaming** that removes:
+  - Python tracebacks and error stack traces
+  - BorgBackup internal signal handling messages
+  - Broken pipe errors
+  - File/line number references
+- **Smart log slicing** showing only the current operation (from last "Worker Start")
+- **Automatic refresh** every 2 seconds
+- **Non-intrusive monitoring** - CTRL+C exits viewer without stopping the job
 
 ### Log Viewer
 
@@ -320,7 +350,7 @@ Option 8 in the interactive menu displays:
 
 - Last 200 lines of the log file
 - Full path to log file
-- Formatted output for easy reading
+- Clean, formatted output
 
 Access via CLI:
 
@@ -343,15 +373,17 @@ sudo journalctl -u borgbase-upload.service -f
 
 ## 🛡️ Security Features
 
-- ✅ No secrets in script code
-- ✅ SSH key-based authentication
-- ✅ Intelligent SSH key auto-detection
-- ✅ Encrypted repository passphrases
-- ✅ GPG-encrypted backup images
-- ✅ Workers run with minimal environment (`env -i`)
-- ✅ Secure file permissions enforcement
-- ✅ Lock file protection against concurrent operations
-- ✅ SSH agent support as fallback
+- ✅ **No hardcoded secrets** - all credentials via environment files
+- ✅ **SSH key-based authentication** with automatic detection
+- ✅ **Intelligent SSH key discovery** across all system users
+- ✅ **Encrypted repository passphrases** stored securely
+- ✅ **GPG-encrypted backup images** for data protection
+- ✅ **Isolated worker processes** - run with minimal environment (`env -i`)
+- ✅ **Secure file permissions** enforcement (600/400)
+- ✅ **Lock file protection** against concurrent operations
+- ✅ **SSH agent support** as fallback authentication
+- ✅ **Comprehensive error trapping** with detailed error messages
+- ✅ **Process isolation** - background workers run in new sessions (`setsid`)
 
 ## 🐛 Troubleshooting
 
@@ -362,18 +394,23 @@ sudo journalctl -u borgbase-upload.service -f
 borg break-lock ssh://user@repo.borgbase.com/./repo
 ```
 
+The script automatically attempts to break locks when stopping jobs.
+
 ### SSH Key Not Found
 
-The script will automatically detect SSH keys. If detection fails:
+The script performs extensive SSH key detection. If automatic detection fails:
 
 ```bash
+# Check which keys were detected (enable debug mode)
+DEBUG=1 ./borgbase_manager.sh
+
 # Explicitly specify SSH key in config
 export SSH_KEY="/path/to/your/key"
 
 # Or add to /etc/borgbase-manager.env
 echo 'SSH_KEY="/path/to/your/key"' | sudo tee -a /etc/borgbase-manager.env
 
-# Check which key would be used
+# Test SSH connection manually
 ssh -v user@user.repo.borgbase.com
 ```
 
@@ -383,29 +420,77 @@ ssh -v user@user.repo.borgbase.com
 # Manually specify source directory
 export SRC_DIR="/path/to/your/backup"
 ./borgbase_manager.sh upload
+
+# Check what the script detected
+DEBUG=1 ./borgbase_manager.sh
 ```
 
 ### Permission Denied
 
 ```bash
-# Ensure proper ownership and permissions
-sudo chown -R root:root /etc/borgbase-manager.env
+# Ensure proper ownership and permissions for config
+sudo chown root:root /etc/borgbase-manager.env
 sudo chmod 600 /etc/borgbase-manager.env
+
+# Secure passphrase file
 sudo chmod 400 /secure/path/to/passphrase
 
 # Check SSH key permissions
 chmod 600 ~/.ssh/id_ed25519
 ```
 
-### View Logs
+### Job Appears Stuck
 
 ```bash
-# Use built-in log viewer
+# View live progress
+./borgbase_manager.sh
+# Then select option 7) Progress
+
+# Or check the log directly
 ./borgbase_manager.sh log
 
-# Or view directly
-sudo tail -f /var/log/borgbase-manager.log
+# Check process status
+ps aux | grep borg
 ```
+
+### Language Selection
+
+```bash
+# Set language in config file
+echo 'UI_LANG="en"' | sudo tee -a /etc/borgbase-manager.env
+
+# Or set as environment variable
+export UI_LANG="en"
+./borgbase_manager.sh
+
+# Language prompt appears on first run if not set
+```
+
+## 🔄 Background Operation Details
+
+### Worker Process Architecture
+
+The script uses a sophisticated background worker architecture:
+
+1. **Main Script**: Handles UI, validation, and job initialization
+2. **Worker Scripts**: Execute actual Borg operations in isolation
+3. **Status Files**: Enable communication between processes
+4. **PID Tracking**: Monitors running operations
+
+**Worker Features:**
+- Run in isolated environment (`env -i`)
+- Start in new session (`setsid`) for independence
+- Redirect output to log file
+- Self-cleanup on completion or failure
+- Comprehensive error handling
+
+### Status Tracking
+
+The script maintains three types of status:
+
+1. **Status File** (`/tmp/borg-status`): Current operation status
+2. **PID File** (`/tmp/borg-upload.pid`): Running process ID
+3. **Log File** (`/var/log/borgbase-manager.log`): Detailed operation log
 
 ## 📝 License
 
@@ -426,6 +511,43 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - **Issues**: [GitHub Issues](https://github.com/yourusername/borgbase-backup-manager/issues)
 - **Documentation**: [BorgBackup Docs](https://borgbackup.readthedocs.io/)
 - **BorgBase**: [BorgBase Support](https://www.borgbase.com/support)
+
+## 🔍 Advanced Features
+
+### Debug Mode
+
+Enable detailed debugging output:
+
+```bash
+DEBUG=1 ./borgbase_manager.sh
+```
+
+This enables Bash's `set -x` mode, showing every command executed.
+
+### Custom Compression
+
+The script uses `lz4` compression by default for speed. To customize:
+
+```bash
+# Edit the worker script section
+# Change: --compression lz4
+# To:     --compression zstd,10  # or other Borg compression options
+```
+
+### Multiple Repositories
+
+You can manage multiple repositories by:
+
+1. Creating separate environment files:
+   - `/etc/borgbase-manager-repo1.env`
+   - `/etc/borgbase-manager-repo2.env`
+
+2. Using different configuration files:
+   ```bash
+   # Copy and customize the script
+   cp borgbase_manager.sh borgbase_manager_repo1.sh
+   # Edit to source different env file
+   ```
 
 ## 🙏 Acknowledgments
 
