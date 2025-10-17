@@ -10,11 +10,11 @@
 #   2) ./.env                         # optional for local testing
 #   3) Runtime environment variables
 #
-# Required variables (placeholders / optional):
+# Required variables (defaults/placeholders):
 #   REPO="ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo"
-#   SSH_KEY=""                         # optional; auto-detected if empty
-#   PASSPHRASE_FILE=""                 # optional; env/agent also fine
-#   SRC_DIR="/mnt/panzerbackup-pm"     # auto-detected if not valid
+#   SSH_KEY="/path/to/id_ed25519"                     # optional (auto-detected)
+#   PASSPHRASE_FILE="/secure/path/passphrase"         # optional (env/agent ok)
+#   SRC_DIR="/mnt/panzerbackup-pm"                    # auto-detected if not valid
 #   LOG_FILE="/var/log/borgbase-manager.log"
 #   PRUNE="yes"  KEEP_LAST="7"
 #
@@ -33,12 +33,13 @@ if [[ -r ./.env ]]; then . ./.env; fi
 
 # ====== DEFAULTS / PLACEHOLDERS ======
 export LC_ALL=C
+umask 077
 
 : "${SRC_DIR:=/mnt/panzerbackup-pm}"
 : "${REPO:=ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo}"
 
-: "${SSH_KEY:=}"             # will be auto-detected if empty
-: "${PASSPHRASE_FILE:=}"     # optional
+: "${SSH_KEY:=}"                 # empty -> real autodetection
+: "${PASSPHRASE_FILE:=}"         # optional; prefer env/agent
 
 : "${LOG_FILE:=/var/log/borgbase-manager.log}"
 : "${STATUS_FILE:=/tmp/borg-status}"
@@ -83,7 +84,9 @@ prompt_yes_no() {
 }
 
 # ===== SSH KEY AUTODETECT =====
-_host_from_repo() { local r="$1"; r="${r#ssh://}"; r="${r%%/*}"; echo "${r#*@}"; }
+_host_from_repo() {
+  local r="$1"; r="${r#ssh://}"; r="${r%%/*}"; echo "${r#*@}"
+}
 
 _collect_keys_in_dir() {
   local d="$1"; [[ -d "$d" ]] || return 0
@@ -95,10 +98,15 @@ _collect_keys_in_dir() {
 }
 
 _keys_from_ssh_config() {
+  # home-aware "~" expansion
   local cfg="$1" host="$2" homebase="$3"; [[ -f "$cfg" ]] || return 0
   awk -v H="$host" '
     BEGIN{IGNORECASE=1; inhost=0}
-    tolower($1)=="host" { inhost=0; for(i=2;i<=NF;i++) if ($i=="*" || tolower($i)==tolower(H)) inhost=1; next }
+    tolower($1)=="host" {
+      inhost=0
+      for(i=2;i<=NF;i++) if ($i=="*" || tolower($i)==tolower(H)) inhost=1
+      next
+    }
     inhost && tolower($1)=="identityfile" { for(i=2;i<=NF;i++) print $i }
   ' "$cfg" \
   | sed -e 's/"//g' -e "s/'//g" \
@@ -110,43 +118,62 @@ _keys_from_ssh_config() {
     done
 }
 
+_home_of_user() {
+  local u="$1"
+  getent passwd "$u" 2>/dev/null | awk -F: '{print $6}' | head -n1
+}
+
 autodetect_ssh_key() {
-  local host keys=() k; host="$(_host_from_repo "$REPO")"
+  local host keys=() k
+  host="$(_host_from_repo "${REPO}")"
 
-  # 1) explicit env path?
-  if [[ -n "${SSH_KEY:-}" && -r "$SSH_KEY" ]]; then
-    echo "$SSH_KEY"; return 0
+  # 0) explicit and readable?
+  if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
+    echo "${SSH_KEY}"
+    return 0
   fi
 
-  # 2) IdentityFile from ssh configs (current user + SUDO_USER)
-  mapfile -t keys < <(_keys_from_ssh_config "$HOME/.ssh/config" "$host" "$HOME")
-  if [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]]; then
-    mapfile -t k < <(_keys_from_ssh_config "/home/$SUDO_USER/.ssh/config" "$host" "/home/$SUDO_USER"); keys+=("${k[@]}")
-  fi
+  # 1) IdentityFile for current user + system-wide
+  mapfile -t k < <(_keys_from_ssh_config "$HOME/.ssh/config" "$host" "$HOME"); keys+=("${k[@]}")
+  [[ -f /etc/ssh/ssh_config ]] && mapfile -t k < <(_keys_from_ssh_config "/etc/ssh/ssh_config" "$host" "$HOME") && keys+=("${k[@]}")
 
-  # 3) conventional file names in common dirs
+  # 2) Conventional key files in $HOME and (if root) /root
   keys+=($(_collect_keys_in_dir "$HOME/.ssh"))
-  [[ $EUID -eq 0 ]] && keys+=($(_collect_keys_in_dir "/root/.ssh"))
-  if [[ $EUID -eq 0 && -n ${SUDO_USER:-} && -d "/home/$SUDO_USER/.ssh" ]]; then
-    keys+=($(_collect_keys_in_dir "/home/$SUDO_USER/.ssh"))
+  if [[ $EUID -eq 0 ]]; then
+    keys+=($(_collect_keys_in_dir "/root/.ssh"))
   fi
 
-  # 4) if root without SUDO_USER → scan all regular user homes
-  if [[ $EUID -eq 0 && -z "${SUDO_USER:-}" ]]; then
+  # 3) If root: SUDO_USER + all regular users from /etc/passwd (non-standard homes supported)
+  if [[ $EUID -eq 0 ]]; then
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      local sudo_home; sudo_home="$(_home_of_user "$SUDO_USER")"
+      [[ -z "$sudo_home" ]] && sudo_home="/home/${SUDO_USER}"
+      keys+=($(_collect_keys_in_dir "${sudo_home}/.ssh"))
+      [[ -f "${sudo_home}/.ssh/config" ]] && mapfile -t k < <(_keys_from_ssh_config "${sudo_home}/.ssh/config" "$host" "$sudo_home") && keys+=("${k[@]}")
+    fi
     while IFS=: read -r name _ uid _ _ home _; do
       [[ $uid -ge 1000 && -d "$home/.ssh" ]] || continue
       keys+=($(_collect_keys_in_dir "$home/.ssh"))
+      [[ -f "$home/.ssh/config" ]] && mapfile -t k < <(_keys_from_ssh_config "$home/.ssh/config" "$host" "$home") && keys+=("${k[@]}")
     done < /etc/passwd
   fi
 
-  # de-dup
+  # 4) Deduplicate and keep only readable files
   if ((${#keys[@]})); then
-    mapfile -t keys < <(printf '%s\n' "${keys[@]}" | awk '!seen[$0]++')
+    mapfile -t keys < <(printf '%s\n' "${keys[@]}" \
+      | awk 'NF' \
+      | while read -r p; do [[ -r "$p" ]] && echo "$p"; done \
+      | awk '!seen[$0]++')
   fi
 
-  # prefer ed25519
-  for k in "${keys[@]}"; do [[ -r "$k" && "$k" == *ed25519* ]] && { echo "$k"; return 0; }; done
-  for k in "${keys[@]}"; do [[ -r "$k" ]] && { echo "$k"; return 0; }; done
+  # 5) Prefer ed25519
+  for k in "${keys[@]}"; do
+    [[ "$k" == *ed25519* ]] && { echo "$k"; return 0; }
+  done
+  for k in "${keys[@]}"; do
+    echo "$k"; return 0
+  done
+
   return 1
 }
 
@@ -229,7 +256,10 @@ setup_borg_env() {
   # Log file prep
   local dir; dir="$(dirname -- "$LOG_FILE")"
   [[ -d "$dir" ]] || mkdir -p "$dir"
-  [[ -e "$LOG_FILE" ]] || : > "$LOG_FILE"
+  if [[ ! -e "$LOG_FILE" ]]; then
+    : > "$LOG_FILE"
+    chmod 600 "$LOG_FILE" || true
+  fi
 }
 
 # ====== STATUS ======
@@ -480,7 +510,7 @@ do_upload() {
     say "Aktueller Status: $(get_status)" "Current status: $(get_status)"
     return 1
   fi
-  if ! preflight_space_check; then
+  if ! preflight_space_check(); then
     say "Upload wurde NICHT gestartet (Preflight fehlgeschlagen)." \
         "Upload NOT started (preflight failed)."
     return 1
@@ -541,7 +571,7 @@ show_progress() {
       say "Letzter Status: ${last_status}" "Last status: ${last_status}"
     fi
     echo ""
-    if [[ "${UI_LANG}" == "en" ]] ; then read -rp "Press Enter to return..." _ || true
+    if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
     else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
     return 0
   fi
@@ -695,7 +725,7 @@ do_stop() {
   pkill -TERM -P "$pid" 2>/dev/null || true
   kill  -TERM "$pid" 2>/dev/null || true
   sleep 1
-  if ps -p "$pid" >/dev/null || pgrep -P "$pid" >/dev/null; then
+  if ps -p "$pid" >/dev/null || pgrep -P "$pid" >/devnull; then
     pkill -KILL -P "$pid" 2>/dev/null || true
     kill  -KILL "$pid" 2>/dev/null || true
     sleep 1
@@ -748,7 +778,7 @@ choose_language
 detect_src_dir || { say "FEHLER: Kein gültiges Backup-Verzeichnis gefunden. Bitte mounten/Pfad prüfen." "ERROR: No valid backup directory found. Please mount/check path."; exit 1; }
 setup_borg_env
 
-# CLI entrypoints
+# CLI entrypoints (optional)
 if [[ $# -gt 0 ]]; then
   case "$1" in
     upload)   if preflight_space_check; then do_upload_background; else say "Upload NICHT gestartet (Preflight fehlgeschlagen)." "Upload NOT started (preflight failed)."; exit 1; fi ;;
