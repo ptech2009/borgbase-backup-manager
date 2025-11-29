@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager (Release)
+# BorgBase Backup Manager
 # Purpose:
 #   - Upload/Download of Panzerbackup artifacts to/from a BorgBase repository
 #   - CLI entrypoints and an interactive TUI-like menu
@@ -9,23 +9,23 @@
 #   1) /etc/borgbase-manager.env      # recommended for systemd EnvironmentFile
 #   2) ./.env                         # optional for local testing
 #   3) Runtime environment variables
-#
-# Required variables (defaults/placeholders):
-#   REPO="ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo"
-#   SSH_KEY="/path/to/id_ed25519"                     # optional (auto-detected)
-#   PASSPHRASE_FILE="/secure/path/passphrase"         # optional (env/agent ok)
-#   SRC_DIR="/mnt/panzerbackup-pm"                    # auto-detected if not valid
-#   LOG_FILE="/var/log/borgbase-manager.log"
-#   PRUNE="yes"  KEEP_LAST="7"
-#
-# Notes:
-#   - No secrets are hardcoded. Provide via env files or unit files.
-#   - Workers run with a minimal, explicit environment (env -i) to avoid leaks.
 
 set -euo pipefail
 set -E
 trap 'rc=$?; echo "FEHLER in Zeile $LINENO beim Kommando: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 [[ "${DEBUG:-0}" == "1" ]] && set -x
+
+# ====== COLORS ======
+# Only use colors if terminal is interactive
+if [[ -t 1 ]]; then
+    R=$'\e[31m'  # Red
+    G=$'\e[32m'  # Green
+    Y=$'\e[33m'  # Yellow
+    B=$'\e[34m'  # Blue
+    NC=$'\e[0m'  # No Color
+else
+    R="" G="" Y="" B="" NC=""
+fi
 
 # ====== LOAD ENV ======
 if [[ -r /etc/borgbase-manager.env ]]; then . /etc/borgbase-manager.env; fi
@@ -33,13 +33,13 @@ if [[ -r ./.env ]]; then . ./.env; fi
 
 # ====== DEFAULTS / PLACEHOLDERS ======
 export LC_ALL=C
-umask 077
 
-: "${SRC_DIR:=/mnt/panzerbackup-pm}"
-: "${REPO:=ssh://<YOUR_USER>@<YOUR_USER>.repo.borgbase.com/./repo}"
+# --- USER CONFIGURATION DEFAULTS (Override via .env files preferred) ---
+: "${SRC_DIR:=/mnt/backup-source}"   # Will be auto-detected if path contains 'panzerbackup'
+: "${REPO:=ssh://xxxxxx@xxxxxx.repo.borgbase.com/./repo}"
 
-: "${SSH_KEY:=}"                 # empty -> real autodetection
-: "${PASSPHRASE_FILE:=}"         # optional; prefer env/agent
+: "${SSH_KEY:=}"                     # Leave empty for auto-detection or set path (e.g. /home/user/.ssh/id_ed25519)
+: "${PASSPHRASE_FILE:=}"             # Optional: Path to file containing passphrase
 
 : "${LOG_FILE:=/var/log/borgbase-manager.log}"
 : "${STATUS_FILE:=/tmp/borg-status}"
@@ -47,6 +47,7 @@ umask 077
 
 : "${PRUNE:=yes}"
 : "${KEEP_LAST:=7}"
+# -----------------------------------------------------------------------
 
 # ====== I18N: Language selection & helpers ======
 choose_language() {
@@ -68,7 +69,7 @@ choose_language() {
 # say "DE text" "EN text"
 say() {
   local de="$1" en="$2"
-  if [[ "${UI_LANG}" == "en" ]]; then echo "$en"; else echo "$de"; fi
+  if [[ "${UI_LANG}" == "en" ]]; then echo -e "$en"; else echo -e "$de"; fi
 }
 
 # prompt_yes_no -> 0=yes  1=no
@@ -98,75 +99,57 @@ _collect_keys_in_dir() {
 }
 
 _keys_from_ssh_config() {
-  # home-aware "~" expansion
-  local cfg="$1" host="$2" homebase="$3"; [[ -f "$cfg" ]] || return 0
+  local cfg="$1" host="$2"; [[ -f "$cfg" ]] || return 0
   awk -v H="$host" '
     BEGIN{IGNORECASE=1; inhost=0}
-    tolower($1)=="host" {
-      inhost=0
-      for(i=2;i<=NF;i++) if ($i=="*" || tolower($i)==tolower(H)) inhost=1
-      next
-    }
+    tolower($1)=="host" { inhost=0; for(i=2;i<=NF;i++) if ($i=="*" || tolower($i)==tolower(H)) inhost=1; next }
     inhost && tolower($1)=="identityfile" { for(i=2;i<=NF;i++) print $i }
   ' "$cfg" \
   | sed -e 's/"//g' -e "s/'//g" \
-  | while read -r p; do
-      case "$p" in
-        "~/"*) echo "${homebase}${p#\~}" ;;
-        *)     echo "$p" ;;
-      esac
-    done
-}
-
-_home_of_user() {
-  local u="$1"
-  getent passwd "$u" 2>/dev/null | awk -F: '{print $6}' | head -n1
+  | while read -r p; do case "$p" in ~/*) echo "${HOME}${p#\~}" ;; *) echo "$p" ;; esac; done
 }
 
 autodetect_ssh_key() {
-  local host keys=() k
+  local host keys=() k d
   host="$(_host_from_repo "${REPO}")"
 
-  # 0) explicit and readable?
+  # 0) Explicitly set + readable? -> Use immediately
   if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
     echo "${SSH_KEY}"
     return 0
   fi
 
-  # 1) IdentityFile for current user + system-wide
-  mapfile -t k < <(_keys_from_ssh_config "$HOME/.ssh/config" "$host" "$HOME"); keys+=("${k[@]}")
-  [[ -f /etc/ssh/ssh_config ]] && mapfile -t k < <(_keys_from_ssh_config "/etc/ssh/ssh_config" "$host" "$HOME") && keys+=("${k[@]}")
+  # 1) IdentityFile from user and global ssh_config
+  mapfile -t k < <(_keys_from_ssh_config "$HOME/.ssh/config" "$host");         keys+=("${k[@]}")
+  mapfile -t k < <(_keys_from_ssh_config "/etc/ssh/ssh_config" "$host");       keys+=("${k[@]}")
 
-  # 2) Conventional key files in $HOME and (if root) /root
+  # 2) Classic key files in $HOME and (if root) in /root
   keys+=($(_collect_keys_in_dir "$HOME/.ssh"))
   if [[ $EUID -eq 0 ]]; then
     keys+=($(_collect_keys_in_dir "/root/.ssh"))
   fi
 
-  # 3) If root: SUDO_USER + all regular users from /etc/passwd (non-standard homes supported)
+  # 3) If root: SUDO_USER + all /home/*/.ssh directories
   if [[ $EUID -eq 0 ]]; then
-    if [[ -n "${SUDO_USER:-}" ]]; then
-      local sudo_home; sudo_home="$(_home_of_user "$SUDO_USER")"
-      [[ -z "$sudo_home" ]] && sudo_home="/home/${SUDO_USER}"
-      keys+=($(_collect_keys_in_dir "${sudo_home}/.ssh"))
-      [[ -f "${sudo_home}/.ssh/config" ]] && mapfile -t k < <(_keys_from_ssh_config "${sudo_home}/.ssh/config" "$host" "$sudo_home") && keys+=("${k[@]}")
+    if [[ -n "${SUDO_USER:-}" && -d "/home/${SUDO_USER}/.ssh" ]]; then
+      keys+=($(_collect_keys_in_dir "/home/${SUDO_USER}/.ssh"))
+      mapfile -t k < <(_keys_from_ssh_config "/home/${SUDO_USER}/.ssh/config" "$host"); keys+=("${k[@]}")
     fi
-    while IFS=: read -r name _ uid _ _ home _; do
-      [[ $uid -ge 1000 && -d "$home/.ssh" ]] || continue
-      keys+=($(_collect_keys_in_dir "$home/.ssh"))
-      [[ -f "$home/.ssh/config" ]] && mapfile -t k < <(_keys_from_ssh_config "$home/.ssh/config" "$host" "$home") && keys+=("${k[@]}")
-    done < /etc/passwd
+    shopt -s nullglob
+    for d in /home/*/.ssh; do
+      keys+=($(_collect_keys_in_dir "$d"))
+      [[ -f "$d/config" ]] && mapfile -t k < <(_keys_from_ssh_config "$d/config" "$host") && keys+=("${k[@]}")
+    done
+    shopt -u nullglob
   fi
 
-  # 4) Deduplicate and keep only readable files
-  if ((${#keys[@]})); then
-    mapfile -t keys < <(printf '%s\n' "${keys[@]}" \
-      | awk 'NF' \
-      | while read -r p; do [[ -r "$p" ]] && echo "$p"; done \
-      | awk '!seen[$0]++')
-  fi
+  # 4) Deduplicate + keep only readable files
+  mapfile -t keys < <(printf '%s\n' "${keys[@]}" \
+    | awk 'NF' \
+    | while read -r p; do [[ -r "$p" ]] && echo "$p"; done \
+    | awk '!seen[$0]++')
 
-  # 5) Prefer ed25519
+  # 5) Preference: ed25519 > others
   for k in "${keys[@]}"; do
     [[ "$k" == *ed25519* ]] && { echo "$k"; return 0; }
   done
@@ -174,6 +157,7 @@ autodetect_ssh_key() {
     echo "$k"; return 0
   done
 
+  # nothing found
   return 1
 }
 
@@ -211,6 +195,7 @@ detect_src_dir() {
 
   local valid=()
   for d in "${candidates[@]:-}"; do has_upload_set "$d" && valid+=( "$d" ); done
+
   (( ${#valid[@]} )) || { say "Kein Verzeichnis mit panzer_*.img.zst.gpg gefunden." "No directory containing panzer_*.img.zst.gpg found."; return 1; }
 
   local best_dir="" best_mtime=0 newest mt
@@ -223,12 +208,12 @@ detect_src_dir() {
 
   [[ -n "$best_dir" ]] || { say "Kein passendes Backup-Verzeichnis gefunden." "No suitable backup directory found."; return 1; }
   SRC_DIR="$best_dir"
-  say "Backup-Verzeichnis gefunden: $SRC_DIR" "Detected backup directory: $SRC_DIR"
+  say "${G}Backup-Verzeichnis gefunden: $SRC_DIR${NC}" "${G}Detected backup directory: $SRC_DIR${NC}"
 }
 
 # ====== BORG ENV SETUP ======
 setup_borg_env() {
-  # SSH key: detect if not specified
+  # Determine SSH key
   local key
   key="$(autodetect_ssh_key || true)"
 
@@ -243,27 +228,25 @@ setup_borg_env() {
           "No key file found — using SSH agent."
     else
       export BORG_RSH="ssh"
-      say "WARNUNG: Kein SSH-Key gefunden. Es werden Standardidentitäten versucht." \
-          "WARNING: No SSH key found. Falling back to default identities."
+      say "${Y}WARNUNG: Kein SSH-Key gefunden. Es werden Standardidentitäten versucht.${NC}" \
+          "${Y}WARNING: No SSH key found. Falling back to default identities.${NC}"
     fi
   fi
 
-  # Borg passphrase (optional)
+  # Borg Passphrase
   if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
     export BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
   fi
 
-  # Log file prep
+  # Prepare Log file
   local dir; dir="$(dirname -- "$LOG_FILE")"
   [[ -d "$dir" ]] || mkdir -p "$dir"
-  if [[ ! -e "$LOG_FILE" ]]; then
-    : > "$LOG_FILE"
-    chmod 600 "$LOG_FILE" || true
-  fi
+  [[ -e "$LOG_FILE" ]] || : > "$LOG_FILE"
 }
 
 # ====== STATUS ======
 set_status() { echo "$1" > "$STATUS_FILE"; }
+
 get_status() {
   if [[ -s "$STATUS_FILE" ]]; then
     tail -n1 "$STATUS_FILE"
@@ -271,6 +254,20 @@ get_status() {
     if [[ "${UI_LANG}" == "en" ]]; then echo "Initializing status..."; else echo "Status wird initialisiert..."; fi
   fi
 }
+# Format status for Menu (with colors)
+get_status_formatted() {
+  local s; s="$(get_status)"
+  if [[ "$s" == *"FEHLER"* || "$s" == *"ERROR"* || "$s" == *"failed"* ]]; then
+    echo "${R}${s}${NC}"
+  elif [[ "$s" == *"Abgeschlossen"* || "$s" == *"Finished"* || "$s" == "OK"* ]]; then
+    echo "${G}${s}${NC}"
+  elif [[ "$s" == *"UPLOAD"* || "$s" == *"DOWNLOAD"* ]]; then
+    echo "${Y}${s}${NC}"
+  else
+    echo "$s"
+  fi
+}
+
 clear_status() { ! is_running && rm -f "$STATUS_FILE"; }
 
 # ====== PROCESS CHECK ======
@@ -318,12 +315,12 @@ preflight_space_check() {
   upload_bytes="$(calc_upload_set_bytes)"
   if [[ "$upload_bytes" -le 0 ]]; then
     set_status "FEHLER: Kein gültiges Upload-Set gefunden."
-    say "Abbruch: Kein gültiges Upload-Set." "Abort: No valid upload set."
+    say "${R}Abbruch: Kein gültiges Upload-Set.${NC}" "${R}Abort: No valid upload set.${NC}"
     return 1
   fi
   set_status "OK: Upload-Set gültig – Größe: $upload_bytes Bytes"
-  say "OK: Upload-Set gefunden – Größe: ${upload_bytes} Bytes" \
-      "OK: Upload set found – size: ${upload_bytes} bytes"
+  say "${G}OK: Upload-Set gefunden – Größe: ${upload_bytes} Bytes${NC}" \
+      "${G}OK: Upload set found – size: ${upload_bytes} bytes${NC}"
   return 0
 }
 
@@ -332,8 +329,8 @@ list_archives() {
   say "Verfügbare Archive im Repository:" "Available archives in repository:"
   echo ""
   if ! borg list --lock-wait 1 "${REPO}" | nl -w2 -s') '; then
-    say "Hinweis: Repository ist derzeit gesperrt (laufender Upload/Download)." \
-        "Note: Repository is currently locked (running upload/download)."
+    say "${Y}Hinweis: Repository ist derzeit gesperrt (laufender Upload/Download).${NC}" \
+        "${Y}Note: Repository is currently locked (running upload/download).${NC}"
   fi
   echo ""
 }
@@ -350,6 +347,7 @@ select_archive() {
   else
     read -rp "Archive-Nummer (1-${#archives[@]}): " choice || { echo "Eingabe beendet."; exit 1; }
   fi
+
   [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#archives[@]} )) || { say "Ungültige Auswahl" "Invalid selection"; exit 1; }
   echo "${archives[$((choice-1))]}"
 }
@@ -378,6 +376,7 @@ fi
 set_status() { echo "$1" > "$STATUS_FILE"; }
 say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
 
+START_TIME=$(date +%s)
 {
   exec >> "$LOG_FILE" 2>&1
   echo "=========================================="
@@ -388,10 +387,12 @@ say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
   HOST="$(hostname -s)"; NOW="$(date +%Y-%m-%d_%H-%M)"; ARCHIVE_PREFIX="Backup-${HOST}"
 
   latest_img="$(ls -1t "${SRC_DIR}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
+
   if [[ -z "${latest_img}" ]]; then set_status "FEHLER: Kein Backup im Quellverzeichnis gefunden"; rm -f "$PID_FILE"; exit 1; fi
 
   base="${latest_img%.img.zst.gpg}"
   img="${base}.img.zst.gpg"; sha="${base}.img.zst.gpg.sha256"; sfd="${base}.sfdisk"
+
   for f in "$img" "$sha" "$sfd"; do [[ -f "$f" ]] || { set_status "FEHLER: Datei fehlt: $(basename "$f")"; rm -f "$PID_FILE"; exit 1; }; done
 
   ARCHIVE="${ARCHIVE_PREFIX}-${NOW}"
@@ -415,14 +416,27 @@ say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
   fi
 
   if [[ "${PRUNE}" == "yes" ]]; then
-    set_status "UPLOAD: Lösche alte Archive..."
+    set_status "UPLOAD: Lösche alte Archive (Prune)..."
     borg prune -v --list "${REPO}" --glob-archives "Backup-${HOST}-*" --keep-last="${KEEP_LAST}" || true
-    set_status "UPLOAD: Komprimiere Repository..."
+    set_status "UPLOAD: Komprimiere Repository (Compact)..."
     borg compact "${REPO}" || true
   fi
 
-  set_status "UPLOAD: Abgeschlossen - ${ARCHIVE}"
-  echo "=========================================="
+  END_TIME=$(date +%s)
+  DURATION=$((END_TIME - START_TIME))
+  
+  # Format Duration (MM:SS)
+  DURATION_FMT="$(printf '%02dm:%02ds\n' $((DURATION%3600/60)) $((DURATION%60)))"
+
+  set_status "UPLOAD: Abgeschlossen - ${ARCHIVE} (Dauer: ${DURATION_FMT})"
+  
+  echo ""
+  echo "------------------------------------------"
+  echo "  SUCCESS SUMMARY"
+  echo "  Archive:  ${ARCHIVE}"
+  echo "  Duration: ${DURATION_FMT}"
+  echo "  End:      $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "------------------------------------------"
   echo "Worker Ende (Upload): $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=========================================="
   rm -f "$PID_FILE"
@@ -464,6 +478,7 @@ fi
 set_status() { echo "$1" > "$STATUS_FILE"; }
 say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
 
+START_TIME=$(date +%s)
 {
   exec >> "$LOG_FILE" 2>&1
   echo "=========================================="
@@ -484,8 +499,18 @@ say() { if [[ "${UI_LANG}" == "en" ]]; then echo "$2"; else echo "$1"; fi; }
     exit $rc
   fi
 
-  set_status "DOWNLOAD: Abgeschlossen - ${SELECTED_ARCHIVE}"
-  echo "=========================================="
+  END_TIME=$(date +%s)
+  DURATION=$((END_TIME - START_TIME))
+  DURATION_FMT="$(printf '%02dm:%02ds\n' $((DURATION%3600/60)) $((DURATION%60)))"
+
+  set_status "DOWNLOAD: Abgeschlossen - ${SELECTED_ARCHIVE} (Dauer: ${DURATION_FMT})"
+  
+  echo ""
+  echo "------------------------------------------"
+  echo "  SUCCESS SUMMARY (Download)"
+  echo "  Archive:  ${SELECTED_ARCHIVE}"
+  echo "  Duration: ${DURATION_FMT}"
+  echo "------------------------------------------"
   echo "Worker Ende (Download): $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=========================================="
   rm -f "$PID_FILE"
@@ -506,27 +531,27 @@ EOFWORKER
 # ====== STARTERS ======
 do_upload() {
   if is_running; then
-    say "Ein Vorgang läuft bereits!" "A job is already running!"
+    say "${Y}Ein Vorgang läuft bereits!${NC}" "${Y}A job is already running!${NC}"
     say "Aktueller Status: $(get_status)" "Current status: $(get_status)"
     return 1
   fi
-  if ! preflight_space_check(); then
-    say "Upload wurde NICHT gestartet (Preflight fehlgeschlagen)." \
-        "Upload NOT started (preflight failed)."
+  if ! preflight_space_check; then
+    say "${R}Upload wurde NICHT gestartet (Preflight fehlgeschlagen).${NC}" \
+        "${R}Upload NOT started (preflight failed).${NC}"
     return 1
   fi
   clear_status
   say "Starte Upload im Hintergrund..." "Starting upload in background..."
   do_upload_background
   echo ""
-  say "Upload wurde gestartet." "Upload started."
+  say "${G}Upload wurde gestartet.${NC}" "${G}Upload started.${NC}"
   say "Verwende Option 7), um den Fortschritt zu sehen." "Use option 7) to watch progress."
   echo ""
 }
 
 do_download() {
   if is_running; then
-    say "Ein Vorgang läuft bereits!" "A job is already running!"
+    say "${Y}Ein Vorgang läuft bereits!${NC}" "${Y}A job is already running!${NC}"
     say "Aktueller Status: $(get_status)" "Current status: $(get_status)"
     return 1
   fi
@@ -536,7 +561,7 @@ do_download() {
   local SELECTED_ARCHIVE
   SELECTED_ARCHIVE="$(select_archive)"
   echo ""
-  say "Gewähltes Archiv: ${SELECTED_ARCHIVE}" "Selected archive: ${SELECTED_ARCHIVE}"
+  say "Gewähltes Archiv: ${B}${SELECTED_ARCHIVE}${NC}" "Selected archive: ${B}${SELECTED_ARCHIVE}${NC}"
   echo ""
   say "Archiv-Inhalt:" "Archive contents:"
   borg list --lock-wait 1 "${REPO}::${SELECTED_ARCHIVE}" || true
@@ -550,7 +575,7 @@ do_download() {
   say "Starte Download im Hintergrund..." "Starting download in background..."
   do_download_background "$SELECTED_ARCHIVE"
   echo ""
-  say "Download wurde gestartet." "Download started."
+  say "${G}Download wurde gestartet.${NC}" "${G}Download started.${NC}"
   say "Verwende Option 7), um den Fortschritt zu sehen." "Use option 7) to watch progress."
   echo ""
 }
@@ -559,7 +584,7 @@ do_download() {
 show_progress() {
   { clear 2>/dev/null || printf '\033c'; } || true
   echo "=========================================="
-  say "         Fortschritt Live-Anzeige" "         Live progress view"
+  say "          Fortschritt Live-Anzeige" "          Live progress view"
   echo "=========================================="
   echo ""
 
@@ -611,13 +636,13 @@ show_progress() {
   while is_running; do
     { clear 2>/dev/null || printf '\033c'; } || true
     echo "=========================================="
-    say "         Fortschritt Live-Anzeige" "         Live progress view"
+    say "          Fortschritt Live-Anzeige" "          Live progress view"
     echo "=========================================="
     echo ""
     if [[ "${UI_LANG}" == "en" ]]; then echo "CTRL+C to stop viewing (job keeps running!)"
     else echo "STRG+C zum Beenden der Anzeige (Vorgang läuft weiter!)"; fi
     echo ""
-    say "Aktueller Status: $(get_status)" "Current status: $(get_status)"
+    say "Aktueller Status: $(get_status_formatted)" "Current status: $(get_status_formatted)"
     echo "=========================================="
     say "Live-Log (aktueller Lauf, max. 80 Zeilen):" "Live log (current run, max. 80 lines):"
     echo "=========================================="
@@ -633,23 +658,23 @@ show_progress() {
 
   echo ""
   echo "=========================================="
-  say "Vorgang abgeschlossen!" "Job finished!"
-  say "Finaler Status: $(get_status)" "Final status: $(get_status)"
+  say "${G}Vorgang abgeschlossen!${NC}" "${G}Job finished!${NC}"
+  say "Finaler Status: $(get_status_formatted)" "Final status: $(get_status_formatted)"
   echo "=========================================="
   echo ""
   if [[ "${UI_LANG}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
   else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
 }
 
-# ====== VIEW LOG ======
+# ====== VIEW LOG (NEW) ======
 view_log() {
   { clear 2>/dev/null || printf '\033c'; } || true
   echo "=========================================="
-  say "                 Log-Ansicht" "                 Log viewer"
+  say "                  Log-Ansicht" "                  Log viewer"
   echo "=========================================="
   echo ""
   if [[ ! -f "$LOG_FILE" ]]; then
-    say "Kein Logfile gefunden: $LOG_FILE" "No log file found: $LOG_FILE"
+    say "${R}Kein Logfile gefunden: $LOG_FILE${NC}" "${R}No log file found: $LOG_FILE${NC}"
   else
     say "Zeige die letzten 200 Zeilen von:" "Showing last 200 lines of:"
     echo "  $LOG_FILE"
@@ -668,8 +693,8 @@ do_info() {
   say "Repository-Informationen:" "Repository information:"
   echo ""
   if ! borg info --lock-wait 1 "${REPO}"; then
-    say "Hinweis: Repository ist derzeit gesperrt (laufender Upload/Download)." \
-        "Note: Repository is currently locked (an upload/download is running)."
+    say "${Y}Hinweis: Repository ist derzeit gesperrt (laufender Upload/Download).${NC}" \
+        "${Y}Note: Repository is currently locked (an upload/download is running).${NC}"
     say "Details, sobald der Vorgang fertig ist. Zwischenstand unter 7) Progress." \
         "Details once the job finishes. Check interim status via option 7) Progress."
     return 1
@@ -681,7 +706,7 @@ do_info() {
 
 do_delete() {
   if is_running; then
-    say "Ein Vorgang läuft, Löschen nicht möglich." "A job is running; delete not possible."
+    say "${Y}Ein Vorgang läuft, Löschen nicht möglich.${NC}" "${Y}A job is running; delete not possible.${NC}"
     return 1
   fi
   say "Archiv aus Repository löschen" "Delete archive from repository"
@@ -689,8 +714,8 @@ do_delete() {
   local SELECTED_ARCHIVE
   SELECTED_ARCHIVE="$(select_archive)"
   echo ""
-  say "WARNUNG: Archiv wird permanent gelöscht!" "WARNING: Archive will be deleted permanently!"
-  say "       Archiv: ${SELECTED_ARCHIVE}" "       Archive: ${SELECTED_ARCHIVE}"
+  say "${R}WARNUNG: Archiv wird permanent gelöscht!${NC}" "${R}WARNING: Archive will be deleted permanently!${NC}"
+  say "        Archiv: ${SELECTED_ARCHIVE}" "        Archive: ${SELECTED_ARCHIVE}"
   echo ""
   if ! prompt_yes_no "Wirklich löschen?" "Really delete?"; then
     say "Abgebrochen" "Cancelled"
@@ -702,7 +727,7 @@ do_delete() {
   echo ""
   say "Gebe Speicherplatz frei (compact)..." "Reclaiming space (compact)..."
   borg compact "${REPO}"
-  say "Archiv gelöscht: ${SELECTED_ARCHIVE}" "Deleted archive: ${SELECTED_ARCHIVE}"
+  say "${G}Archiv gelöscht: ${SELECTED_ARCHIVE}${NC}" "${G}Deleted archive: ${SELECTED_ARCHIVE}${NC}"
 }
 
 do_stop() {
@@ -716,8 +741,8 @@ do_stop() {
     rm -f "$PID_FILE"
     return 0
   fi
-  say "Stoppe laufenden Vorgang (PID: $pid) und Kindprozesse..." \
-      "Stopping running job (PID: $pid) and child processes..."
+  say "${Y}Stoppe laufenden Vorgang (PID: $pid) und Kindprozesse...${NC}" \
+      "${Y}Stopping running job (PID: $pid) and child processes...${NC}"
   if ! prompt_yes_no "Wirklich stoppen?" "Really stop?"; then
     say "Abbruch." "Aborted."
     return 0
@@ -725,14 +750,14 @@ do_stop() {
   pkill -TERM -P "$pid" 2>/dev/null || true
   kill  -TERM "$pid" 2>/dev/null || true
   sleep 1
-  if ps -p "$pid" >/dev/null || pgrep -P "$pid" >/devnull; then
+  if ps -p "$pid" >/dev/null || pgrep -P "$pid" >/dev/null; then
     pkill -KILL -P "$pid" 2>/dev/null || true
     kill  -KILL "$pid" 2>/dev/null || true
     sleep 1
   fi
   rm -f "$PID_FILE"
   set_status "GESTOPPT: Manuell abgebrochen"
-  say "Vorgang gestoppt." "Job stopped."
+  say "${R}Vorgang gestoppt.${NC}" "${R}Job stopped.${NC}"
   if ! is_running; then
     borg break-lock "${REPO}" >/dev/null 2>&1 || true
   fi
@@ -743,7 +768,7 @@ show_menu() {
   { clear 2>/dev/null || printf '\033c'; } || true
   echo ""
   echo "╔═══════════════════════════════════════════════╗"
-  echo "║        BorgBase Backup Manager                ║"
+  echo "║         BorgBase Backup Manager               ║"
   echo "╚═══════════════════════════════════════════════╝"
   echo ""
   echo "Repository: ${REPO}"
@@ -754,28 +779,29 @@ show_menu() {
   fi
   echo ""
   if is_running; then
-    say "STATUS: Vorgang läuft!" "STATUS: Job running!"
-    echo "        $(get_status)"
+    say "${Y}STATUS: Vorgang läuft!${NC}" "${Y}STATUS: Job running!${NC}"
+    echo "        $(get_status_formatted)"
   else
-    say "STATUS: Bereit" "STATUS: Ready"
-    [[ -f "$STATUS_FILE" ]] && say "        Letzter Status: $(get_status)" "        Last status: $(get_status)"
+    say "${G}STATUS: Bereit${NC}" "${G}STATUS: Ready${NC}"
+    [[ -f "$STATUS_FILE" ]] && say "        Letzter Status: $(get_status_formatted)" "        Last status: $(get_status_formatted)"
   fi
   echo ""
   say "1) Upload   - Neuestes lokales Backup hochladen" "1) Upload   - Upload latest local backup"
   say "2) Download - Backup von BorgBase herunterladen" "2) Download - Download backup from BorgBase"
-  say "3) List     - Alle Archive anzeigen"             "3) List     - Show all archives"
-  say "4) Info     - Repository-Informationen"          "4) Info     - Repository information"
-  say "5) Delete   - Archiv löschen"                    "5) Delete   - Delete archive"
-  say "6) Stop     - Laufenden Vorgang abbrechen"       "6) Stop     - Stop running job"
-  say "7) Progress - Fortschritt anzeigen (Live)"       "7) Progress - Show live progress"
-  say "8) Log      - Logfile anzeigen"                  "8) Log      - View log file"
-  say "9) Exit"                                        "9) Exit"
+  say "3) List     - Alle Archive anzeigen"              "3) List     - Show all archives"
+  say "4) Info     - Repository-Informationen"           "4) Info     - Repository information"
+  say "5) Delete   - Archiv löschen"                     "5) Delete   - Delete archive"
+  say "6) Stop     - Laufenden Vorgang abbrechen"        "6) Stop     - Stop running job"
+  say "7) Progress - Fortschritt anzeigen (Live)"        "7) Progress - Show live progress"
+  say "8) Log      - Logfile anzeigen"                   "8) Log      - View log file"
+  say "9) Exit"                                         "9) Exit"
   echo ""
 }
 
 # ====== MAIN ======
 choose_language
-detect_src_dir || { say "FEHLER: Kein gültiges Backup-Verzeichnis gefunden. Bitte mounten/Pfad prüfen." "ERROR: No valid backup directory found. Please mount/check path."; exit 1; }
+
+detect_src_dir || { say "${R}FEHLER: Kein gültiges Backup-Verzeichnis gefunden. Bitte mounten/Pfad prüfen.${NC}" "${R}ERROR: No valid backup directory found. Please mount/check path.${NC}"; exit 1; }
 setup_borg_env
 
 # CLI entrypoints (optional)
