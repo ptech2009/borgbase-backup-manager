@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 # BorgBase Backup Manager (GitHub-ready)
 #
-# Features:
-# - Per-user config in ~/.config/borgbase-backup-manager/borgbase-manager.env
-# - Wizard (and reconfigure option) writes config + securely stores repo passphrase in a file
-# - Auto-detects Panzerbackup source directory (panzer_*.img.zst.gpg) across /mnt, /media, /run/media
-# - SSH key auto-detection (multi-level) with manual fallback
-# - Connection test to Borg repo (SSH + borg info)
-# - Upload/Download are blocked until repo connection is OK (preflight before worker start)
-# - Startup repo check: on every script start, status is set to OK/FEHLER (if config exists)
+# Fixes in this version:
+# - No hard exit from menu when connection test fails (set -e + ERR trap safe handling)
+# - Repo lock timeout is treated as WARNING (or OK if own worker running), not "connection failed"
+# - Live progress display is more readable (convert CR -> NL, de-duplicate repeated lines)
+# - Menu status line padding works with ANSI colors (strip ANSI for width calculation)
 #
 # Requirements:
-#   bash >= 4, borg >= 1.2, ssh, findmnt(optional), ssh-keygen(optional), ssh-agent/ssh-add (if encrypted key + non-interactive)
-#
-# Security notes:
-# - Do NOT store the repo passphrase directly in the env file.
-# - Wizard stores it in PASSPHRASE_FILE (chmod 600) and exports BORG_PASSPHRASE at runtime.
-# - SSH key passphrase storage is optional; if you use it, store in SSH_KEY_PASSPHRASE_FILE (chmod 600).
+#   bash >= 4, borg >= 1.2, ssh, findmnt(optional), ssh-keygen(optional), ssh-keyscan(optional)
 
 set -euo pipefail
 set -E
@@ -30,6 +22,30 @@ if [[ -t 1 ]]; then
 else
   R=""; G=""; Y=""; B=""; NC=""
 fi
+
+# -------------------- UI constants --------------------
+MENU_INNER_WIDTH=60   # box inner width (approx; used only for padding)
+STATUS_FIELD_WIDTH=49 # used in the status line "Status: ...." alignment
+
+strip_ansi() {
+  # remove ANSI escape codes for length calculations
+  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+}
+
+pad_to_width() {
+  # $1 = width (visible), $2 = string (may include ANSI)
+  local width="$1"
+  local s="$2"
+  local plain len pad
+  plain="$(printf '%s' "$s" | strip_ansi)"
+  len="${#plain}"
+  if (( len >= width )); then
+    printf '%s' "$s"
+    return 0
+  fi
+  pad=$((width - len))
+  printf '%s%*s' "$s" "$pad" ""
+}
 
 # -------------------- Paths (per-user) --------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/borgbase-backup-manager"
@@ -61,14 +77,15 @@ SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS:-$HOME/.ssh/known_hosts}"
 
 LOG_FILE="${LOG_FILE:-$DEFAULT_STATE_DIR/borgbase-manager.log}"
 
-PASSPHRASE_FILE="${PASSPHRASE_FILE:-$DEFAULT_PASSPHRASE_FILE}"                 # repo passphrase file
+PASSPHRASE_FILE="${PASSPHRASE_FILE:-$DEFAULT_PASSPHRASE_FILE}"                       # repo passphrase file
 SSH_KEY_PASSPHRASE_FILE="${SSH_KEY_PASSPHRASE_FILE:-$DEFAULT_SSHKEY_PASSPHRASE_FILE}" # optional ssh-key passphrase file
 
 PRUNE="${PRUNE:-yes}"
 KEEP_LAST="${KEEP_LAST:-1}"
 
-SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-5}"
-BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-5}"
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
+BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-5}"     # worker lock-wait (create/extract/prune/compact)
+BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT:-1}" # connection test lock-wait (short; lock => warning)
 
 AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY:-no}" # if yes: ssh-keyscan (optional)
 AUTO_TEST_SSH="${AUTO_TEST_SSH:-yes}"
@@ -79,7 +96,6 @@ load_env() {
   # shellcheck disable=SC1090
   [[ -r "$ENV_FILE" ]] && source "$ENV_FILE"
 
-  # Optional local override for dev/test (must NOT throw if missing)
   if [[ -r "./.env" ]]; then
     # shellcheck disable=SC1091
     source "./.env"
@@ -120,6 +136,8 @@ get_status_formatted() {
   local s; s="$(get_status)"
   if [[ "$s" == *"FEHLER"* || "$s" == *"ERROR"* || "$s" == *"failed"* ]]; then
     echo "${R}${s}${NC}"
+  elif [[ "$s" == *"WARN"* || "$s" == *"Repo gesperrt"* || "$s" == *"locked"* || "$s" == *"BUSY"* ]]; then
+    echo "${Y}${s}${NC}"
   elif [[ "$s" == *"Abgeschlossen"* || "$s" == *"Finished"* || "$s" == OK* ]]; then
     echo "${G}${s}${NC}"
   elif [[ "$s" == *"UPLOAD"* || "$s" == *"DOWNLOAD"* ]]; then
@@ -162,12 +180,61 @@ expand_path() {
   echo "$p"
 }
 
-_host_from_repo() { local r="$1"; r="${r#ssh://}"; r="${r%%/*}"; echo "${r#*@}"; }
-_user_from_repo() { local r="$1"; r="${r#ssh://}"; r="${r%%/*}"; echo "${r%%@*}"; }
-
 human_bytes() {
   local b="${1:-0}"
   awk -v b="$b" 'function human(x){s="B KiB MiB GiB TiB PiB";split(s,a," ");i=1;while(x>=1024&&i<6){x/=1024;i++}return sprintf("%.2f %s",x,a[i])} BEGIN{print human(b)}'
+}
+
+# -------------------- Repo parsing (port-aware) --------------------
+_repo_authority() {
+  local r="$1"
+  r="${r#ssh://}"
+  r="${r%%/*}"
+  echo "$r"
+}
+
+_user_from_repo() {
+  local a; a="$(_repo_authority "$1")"
+  echo "${a%%@*}"
+}
+
+_host_from_repo() {
+  local a hostport
+  a="$(_repo_authority "$1")"
+  hostport="${a#*@}"
+  echo "${hostport%%:*}"
+}
+
+_port_from_repo() {
+  local a hostport
+  a="$(_repo_authority "$1")"
+  hostport="${a#*@}"
+  if [[ "$hostport" == *:* ]]; then
+    echo "${hostport##*:}"
+  else
+    echo ""
+  fi
+}
+
+_knownhosts_host_from_repo() {
+  local h p
+  h="$(_host_from_repo "$1")"
+  p="$(_port_from_repo "$1")"
+  if [[ -n "$p" ]]; then
+    echo "[${h}]:${p}"
+  else
+    echo "$h"
+  fi
+}
+
+_ssh_port_opt_from_repo() {
+  local p
+  p="$(_port_from_repo "$1")"
+  if [[ -n "$p" ]]; then
+    echo "-p" "$p"
+  else
+    echo ""
+  fi
 }
 
 # -------------------- Panzerbackup SRC auto-detection --------------------
@@ -367,17 +434,26 @@ ensure_known_hosts() {
   command -v ssh-keygen >/dev/null 2>&1 || return 0
   command -v ssh-keyscan >/dev/null 2>&1 || return 0
 
-  local host; host="$(_host_from_repo "${REPO}")"
+  local host plain_host port host_for_kh
+  plain_host="$(_host_from_repo "${REPO}")"
+  port="$(_port_from_repo "${REPO}")"
+  host_for_kh="$(_knownhosts_host_from_repo "${REPO}")"
+
   mkdir -p "$(dirname -- "$SSH_KNOWN_HOSTS")" 2>/dev/null || true
   touch "$SSH_KNOWN_HOSTS" 2>/dev/null || true
 
-  if ssh-keygen -F "$host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
+  if ssh-keygen -F "$host_for_kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
     return 0
   fi
 
-  say "SSH: Hostkey für ${host} fehlt – füge via ssh-keyscan hinzu..." \
-      "SSH: Missing hostkey for ${host} — adding via ssh-keyscan..."
-  timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -t ed25519,ecdsa,rsa "$host" >> "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+  say "SSH: Hostkey für ${host_for_kh} fehlt – füge via ssh-keyscan hinzu..." \
+      "SSH: Missing hostkey for ${host_for_kh} — adding via ssh-keyscan..."
+
+  if [[ -n "$port" ]]; then
+    timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -p "$port" -t ed25519,ecdsa,rsa "$plain_host" >> "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+  else
+    timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -t ed25519,ecdsa,rsa "$plain_host" >> "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+  fi
 }
 
 # -------------------- Repo passphrase handling --------------------
@@ -405,8 +481,11 @@ setup_borg_env() {
   resolve_ssh_key || true
   ensure_known_hosts
 
+  local port_opt
+  port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
+
   local ssh_base
-  ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
+  ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT} ${port_opt}"
 
   if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
     export BORG_RSH="${ssh_base} -i ${SSH_KEY} -o IdentitiesOnly=yes"
@@ -427,14 +506,17 @@ setup_borg_env() {
 test_ssh_auth() {
   [[ "${AUTO_TEST_SSH}" == "yes" ]] || return 0
 
-  local host user out
+  local host user out port_opt
   host="$(_host_from_repo "${REPO}")"
   user="$(_user_from_repo "${REPO}")"
+  port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
 
+  # shellcheck disable=SC2086
   out="$(ssh -T -o RequestTTY=no -o BatchMode=yes \
     -o StrictHostKeyChecking=yes \
     -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" \
     -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" \
+    ${port_opt} \
     ${SSH_KEY:+-i "$SSH_KEY" -o IdentitiesOnly=yes} \
     "${user}@${host}" -- borg --version 2>&1 || true)"
 
@@ -453,7 +535,6 @@ test_ssh_auth() {
     return 1
   fi
 
-  # "borg x.y.z" is expected on success
   echo "$out" | grep -qiE '^borg ' || {
     set_status "FEHLER: SSH Test fehlgeschlagen."
     return 1
@@ -462,10 +543,34 @@ test_ssh_auth() {
   return 0
 }
 
+is_lock_timeout_output() {
+  # borg lock timeout typical messages
+  grep -qiE 'Failed to create/acquire the lock|lock\.exclusive|timeout\)\.|repository is already locked|Could not acquire lock' <<<"$1"
+}
+
 test_borg_repo() {
   [[ "${AUTO_TEST_REPO}" == "yes" ]] || return 0
-  borg info --lock-wait "${BORG_LOCK_WAIT}" "${REPO}" >> "$LOG_FILE" 2>&1 || return 1
-  return 0
+
+  local out rc
+  out="$(borg info --lock-wait "${BORG_TEST_LOCK_WAIT}" "${REPO}" 2>&1)" || rc=$? || true
+  rc="${rc:-0}"
+
+  echo "$out" >> "$LOG_FILE" 2>/dev/null || true
+
+  if (( rc == 0 )); then
+    return 0
+  fi
+
+  if is_lock_timeout_output "$out"; then
+    if is_running; then
+      set_status "OK: Repo erreichbar (BUSY/Lock durch laufenden Job)."
+      return 0
+    fi
+    set_status "WARNUNG: Repo gesperrt (Lock-Timeout) – später erneut versuchen."
+    return 2
+  fi
+
+  return 1
 }
 
 test_connection() {
@@ -475,19 +580,28 @@ test_connection() {
     return 1
   fi
 
-  if ! test_borg_repo; then
+  # repo test can return:
+  # 0 = OK
+  # 2 = WARN (locked)
+  # 1 = ERROR
+  if test_borg_repo; then
+    set_status "OK: Verbindung erfolgreich hergestellt."
+    echo -e "${G}Verbindung erfolgreich hergestellt.${NC}"
+    [[ -n "${SSH_KEY:-}" ]] && echo "SSH_KEY: $SSH_KEY"
+    echo "REPO: $REPO"
+    return 0
+  else
+    local rc=$?
+    if (( rc == 2 )); then
+      echo -e "${Y}$(say 'Repo ist derzeit gesperrt (Lock). SSH/Passphrase sind OK.' 'Repo is currently locked. SSH/passphrase are OK.')${NC}"
+      return 2
+    fi
     set_status "FEHLER: Repo-Verbindung fehlgeschlagen."
     return 1
   fi
-
-  set_status "OK: Verbindung erfolgreich hergestellt."
-  echo -e "${G}Verbindung erfolgreich hergestellt.${NC}"
-  [[ -n "${SSH_KEY:-}" ]] && echo "SSH_KEY: $SSH_KEY"
-  echo "REPO: $REPO"
-  return 0
 }
 
-# -------------------- Startup repo status check (on every script start) --------------------
+# -------------------- Startup repo status check --------------------
 startup_repo_check() {
   ensure_logfile_writable
 
@@ -499,7 +613,6 @@ startup_repo_check() {
 
   load_env || true
 
-  # Basic sanity: PASSFILE must be a path; if user accidentally stored passphrase text -> reset + warn
   PASSPHRASE_FILE="$(expand_path "${PASSPHRASE_FILE:-$DEFAULT_PASSPHRASE_FILE}")"
   if [[ "$PASSPHRASE_FILE" != /* ]]; then
     PASSPHRASE_FILE="$DEFAULT_PASSPHRASE_FILE"
@@ -512,8 +625,12 @@ startup_repo_check() {
     return 0
   fi
 
-  # Silent test -> status is set by test_connection
-  test_connection >/dev/null 2>&1 || true
+  # Silent test -> status is set by test_connection, but never exit script
+  if test_connection >/dev/null 2>&1; then
+    :
+  else
+    :
+  fi
   return 0
 }
 
@@ -546,6 +663,7 @@ KEEP_LAST="${KEEP_LAST}"
 
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT}"
 BORG_LOCK_WAIT="${BORG_LOCK_WAIT}"
+BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT}"
 
 AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY}"
 AUTO_TEST_SSH="${AUTO_TEST_SSH}"
@@ -603,16 +721,14 @@ configure_wizard() {
 
   choose_language_prompt
 
-  # REPO loop (until minimal format ok)
   while true; do
-    read_line "$(say 'BorgBase Repo URL (ssh://user@host/./repo)' 'BorgBase repo URL (ssh://user@host/./repo)')" REPO "$REPO"
+    read_line "$(say 'BorgBase Repo URL (ssh://user@host[:port]/./repo)' 'BorgBase repo URL (ssh://user@host[:port]/./repo)')" REPO "$REPO"
     if ensure_repo_format_minimal; then
       break
     fi
     echo -e "${R}$(say 'Ungültiges REPO-Format. Muss mit ssh:// beginnen und user@host enthalten.' 'Invalid REPO format. Must start with ssh:// and include user@host.')${NC}"
   done
 
-  # SRC_DIR (empty => auto)
   local src_in=""
   read -r -p "$(say 'Quellverzeichnis (SRC_DIR) - Enter für Auto-Detection panzerbackup' 'Source directory (SRC_DIR) - Enter for panzerbackup auto-detection') [auto]: " src_in || src_in=""
   src_in="$(expand_path "$src_in")"
@@ -624,7 +740,6 @@ configure_wizard() {
 
   read_line "$(say 'Preferred SSH key hint (optional, e.g. newvorta)' 'Preferred SSH key hint (optional, e.g. newvorta)')" PREFERRED_KEY_HINT "${PREFERRED_KEY_HINT:-}"
 
-  # SSH_KEY (empty => auto)
   local key_in=""
   read -r -p "$(say 'SSH_KEY Pfad (leer lassen für Auto-Detection)' 'SSH_KEY path (leave empty for auto-detection)') [auto]: " key_in || key_in=""
   key_in="$(expand_path "$key_in")"
@@ -637,7 +752,6 @@ configure_wizard() {
   read_line "$(say 'SSH known_hosts Pfad' 'SSH known_hosts path')" SSH_KNOWN_HOSTS "$SSH_KNOWN_HOSTS"
   SSH_KNOWN_HOSTS="$(expand_path "$SSH_KNOWN_HOSTS")"
 
-  # Passphrase file path MUST be a path (absolute). If not, force default.
   read_line "$(say 'Pfad zur Repo-Passphrase-Datei (empfohlen)' 'Repo passphrase file path (recommended)')" PASSPHRASE_FILE "$PASSPHRASE_FILE"
   PASSPHRASE_FILE="$(expand_path "$PASSPHRASE_FILE")"
   if [[ "$PASSPHRASE_FILE" != /* ]]; then
@@ -646,7 +760,6 @@ configure_wizard() {
   fi
   mkdir -p "$(dirname -- "$PASSPHRASE_FILE")" 2>/dev/null || true
 
-  # Optional SSH-key passphrase file (also path)
   read_line "$(say 'Pfad zur SSH-Key-Passphrase-Datei (optional)' 'SSH key passphrase file path (optional)')" SSH_KEY_PASSPHRASE_FILE "$SSH_KEY_PASSPHRASE_FILE"
   SSH_KEY_PASSPHRASE_FILE="$(expand_path "$SSH_KEY_PASSPHRASE_FILE")"
   if [[ "$SSH_KEY_PASSPHRASE_FILE" != /* ]]; then
@@ -657,54 +770,45 @@ configure_wizard() {
 
   ensure_logfile_writable
 
-  # Detect SRC_DIR if empty
   if [[ -z "${SRC_DIR:-}" ]]; then
     detect_src_dir || true
   fi
 
-  # Resolve SSH key if empty
   if [[ -z "${SSH_KEY:-}" ]]; then
     resolve_ssh_key || true
   fi
 
-  # Persist preliminary config
   write_env_file
   load_env || true
 
-  # Ensure passphrase exists (loop until set)
   if [[ ! -f "$PASSPHRASE_FILE" || ! -s "$PASSPHRASE_FILE" ]]; then
     echo -e "${Y}$(say 'Repo-Passphrase eingeben (wird in Datei gespeichert).' 'Enter repo passphrase (will be stored in file).')${NC}"
     prompt_repo_passphrase_loop
   fi
 
-  # Test connection loop: if fails due to passphrase missing/wrong/etc, re-run until OK
   while true; do
     echo ""
     echo "$(say 'Teste Verbindung zum Repo...' 'Testing repository connection...')"
     if test_connection; then
       break
+    else
+      rc=$?
+      if (( rc == 2 )); then
+        echo -e "${Y}$(say 'Repo ist gesperrt (Lock). Das ist ok, wenn gerade ein Job läuft.' 'Repo is locked. This is ok if a job is currently running.')${NC}"
+        break
+      fi
     fi
 
     echo -e "${R}$(say 'Verbindung fehlgeschlagen.' 'Connection failed.')${NC}"
     echo -e "${Y}$(say 'Wenn die Passphrase falsch ist: bitte erneut eingeben.' 'If passphrase is wrong: please re-enter.')${NC}"
 
-    # if passphrase file is missing/empty or repo passphrase wrong, just re-prompt
-    if [[ ! -f "$PASSPHRASE_FILE" || ! -s "$PASSPHRASE_FILE" ]]; then
-      prompt_repo_passphrase_loop
-      write_env_file
-      continue
-    fi
-
-    # If user wants to fix REPO/SSH_KEY quickly, offer wizard step
     local ans=""
     read -r -p "$(say 'REPO/SSH_KEY ändern? (y/n) ' 'Change REPO/SSH_KEY? (y/n) ')" ans || ans="n"
     if [[ "$ans" =~ ^[Yy]$ ]]; then
-      # Re-run wizard fully
       configure_wizard
       return $?
     fi
 
-    # Otherwise: just re-enter repo passphrase
     prompt_repo_passphrase_loop
     write_env_file
   done
@@ -718,6 +822,30 @@ ensure_config_exists() {
     configure_wizard || return 1
   else
     load_env || true
+  fi
+}
+
+# -------------------- Live progress (readable) --------------------
+follow_log_live() {
+  ensure_logfile_writable
+  [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE" 2>/dev/null || true
+
+  echo ""
+  echo "$(say 'Live-Progress: Log wird verfolgt (bereinigt). Beenden mit Ctrl+C.' 'Live progress: following log (cleaned). Exit with Ctrl+C.')"
+  echo "$(say "LOG_FILE: $LOG_FILE" "LOG_FILE: $LOG_FILE")"
+  echo ""
+
+  # Clean output:
+  # - convert CR (\r) progress updates to new lines
+  # - drop duplicate consecutive lines (progress spam)
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL tail -n 200 -f "$LOG_FILE" \
+      | sed -u 's/\r/\n/g' \
+      | awk 'NF{ if($0!=prev){print; prev=$0} }'
+  else
+    tail -n 200 -f "$LOG_FILE" \
+      | sed -u 's/\r/\n/g' \
+      | awk 'NF{ if($0!=prev){print; prev=$0} }'
   fi
 }
 
@@ -745,7 +873,6 @@ export LC_ALL=C
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 
-# Non-interactive: ensure passphrase loaded
 if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
   export BORG_PASSPHRASE
   BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
@@ -981,6 +1108,7 @@ show_menu() {
       echo "║  6) Show settings                                          ║"
       echo "║  7) Clear status                                           ║"
       echo "║  8) Reconfigure (Wizard)                                   ║"
+      echo "║  9) Live progress (follow log)                             ║"
       echo "║  q) Quit                                                   ║"
     else
       echo "║  1) Backup zu BorgBase hochladen                           ║"
@@ -991,12 +1119,14 @@ show_menu() {
       echo "║  6) Einstellungen anzeigen                                 ║"
       echo "║  7) Status löschen                                         ║"
       echo "║  8) Konfiguration neu (Wizard)                             ║"
+      echo "║  9) Live Progress (Log folgen)                             ║"
       echo "║  q) Beenden                                                ║"
     fi
 
     echo "╠════════════════════════════════════════════════════════════╣"
     local status_line; status_line="$(get_status_formatted)"
-    printf "║  Status: %-49s ║\n" "${status_line}"
+    local padded; padded="$(pad_to_width "$STATUS_FIELD_WIDTH" "$status_line")"
+    printf "║  Status: %s ║\n" "$padded"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
 
@@ -1012,11 +1142,17 @@ show_menu() {
         detect_src_dir || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         show_upload_selection || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
 
-        # HARD GATE: Upload only if repo test is successful
-        if ! test_connection; then
-          echo -e "${R}$(say 'Upload ist gesperrt, solange die Repo-Verbindung nicht OK ist.' 'Upload is blocked until repo connection is OK.')${NC}"
-          pause_tty "$(say 'Weiter...' 'Continue...')"
-          continue
+        if test_connection; then
+          :
+        else
+          rc=$?
+          if (( rc == 2 )); then
+            echo -e "${Y}$(say 'Repo ist gesperrt (Lock). Upload kann trotzdem versucht werden (wartet auf Lock).' 'Repo is locked. You may still try upload (will wait for lock).')${NC}"
+          else
+            echo -e "${R}$(say 'Upload ist gesperrt, solange SSH/Repo nicht erreichbar ist.' 'Upload is blocked until SSH/repo is reachable.')${NC}"
+            pause_tty "$(say 'Weiter...' 'Continue...')"
+            continue
+          fi
         fi
 
         if is_running; then
@@ -1028,6 +1164,7 @@ show_menu() {
         pause_tty "$(say 'Enter = Upload starten (CTRL+C zum Abbrechen) ' 'Press Enter to start upload (CTRL+C to abort) ')"
         do_upload_background
         echo -e "${G}$(say 'Upload im Hintergrund gestartet.' 'Upload started in background.')${NC}"
+        echo -e "${Y}$(say 'Tipp: Menüpunkt 9 = Live Progress (Log folgen).' 'Tip: menu 9 = Live progress (follow log).')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
 
@@ -1035,11 +1172,17 @@ show_menu() {
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         detect_src_dir || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
 
-        # HARD GATE: Download only if repo test is successful
-        if ! test_connection; then
-          echo -e "${R}$(say 'Download ist gesperrt, solange die Repo-Verbindung nicht OK ist.' 'Download is blocked until repo connection is OK.')${NC}"
-          pause_tty "$(say 'Weiter...' 'Continue...')"
-          continue
+        if test_connection; then
+          :
+        else
+          rc=$?
+          if (( rc == 2 )); then
+            echo -e "${Y}$(say 'Repo ist gesperrt (Lock). Download kann trotzdem versucht werden (wartet auf Lock).' 'Repo is locked. You may still try download (will wait for lock).')${NC}"
+          else
+            echo -e "${R}$(say 'Download ist gesperrt, solange SSH/Repo nicht erreichbar ist.' 'Download is blocked until SSH/repo is reachable.')${NC}"
+            pause_tty "$(say 'Weiter...' 'Continue...')"
+            continue
+          fi
         fi
 
         if is_running; then
@@ -1052,14 +1195,21 @@ show_menu() {
         archive="$(select_archive)" || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         do_download_background "$archive"
         echo -e "${G}$(say 'Download im Hintergrund gestartet.' 'Download started in background.')${NC}"
+        echo -e "${Y}$(say 'Tipp: Menüpunkt 9 = Live Progress (Log folgen).' 'Tip: menu 9 = Live progress (follow log).')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
 
       3)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
-        if ! test_connection; then
-          pause_tty "$(say 'Weiter...' 'Continue...')"
-          continue
+        # listing often works even if repo is locked; only block on real connectivity problems
+        if test_connection; then
+          :
+        else
+          rc=$?
+          if (( rc != 2 )); then
+            pause_tty "$(say 'Weiter...' 'Continue...')"
+            continue
+          fi
         fi
         list_archives
         pause_tty "$(say 'Weiter...' 'Continue...')"
@@ -1067,7 +1217,16 @@ show_menu() {
 
       4)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
-        test_connection
+        if test_connection; then
+          :
+        else
+          rc=$?
+          if (( rc == 2 )); then
+            echo -e "${Y}$(say 'Repo ist gesperrt (Lock). Verbindung/SSH ist OK.' 'Repo is locked. Connectivity/SSH is OK.')${NC}"
+          else
+            echo -e "${R}$(say 'Verbindungstest fehlgeschlagen. Details im Log (Menüpunkt 5).' 'Connection test failed. See log (menu 5).')${NC}"
+          fi
+        fi
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
 
@@ -1096,6 +1255,10 @@ show_menu() {
         load_env || true
         configure_wizard
         pause_tty "$(say 'Weiter...' 'Continue...')"
+        ;;
+
+      9)
+        follow_log_live
         ;;
 
       q|Q)
@@ -1128,27 +1291,27 @@ case "$cmd" in
     ;;
   test)
     ensure_config_exists
-    test_connection
+    if test_connection; then :; else :; fi
     ;;
   upload)
     ensure_config_exists
     detect_src_dir
     show_upload_selection
-    test_connection
+    if test_connection; then :; else :; fi
     is_running && { echo "Already running."; exit 1; }
     do_upload_background
     ;;
   download)
     ensure_config_exists
     detect_src_dir
-    test_connection
+    if test_connection; then :; else :; fi
     is_running && { echo "Already running."; exit 1; }
     archive="$(select_archive)"
     do_download_background "$archive"
     ;;
   list)
     ensure_config_exists
-    test_connection
+    if test_connection; then :; else :; fi
     list_archives
     ;;
   status)
