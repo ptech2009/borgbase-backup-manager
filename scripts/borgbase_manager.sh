@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # BorgBase Backup Manager (GitHub-ready)
 #
-# Fixes in this version:
+# Features / Fixes:
+# - ALWAYS show a language selector on interactive start (DE/EN) before the menu (requested).
+#   - Default selection is the last saved UI_LANG (from ENV_FILE or env), but prompt is shown every time.
+#   - Non-interactive runs (no TTY) will not prompt and will keep UI_LANG (or default to de).
 # - No hard exit from menu when connection test fails (set -e + ERR trap safe handling)
 # - Repo lock timeout is treated as WARNING (or OK if own worker running), not "connection failed"
 # - Live progress display is more readable (convert CR -> NL, de-duplicate repeated lines)
@@ -24,16 +27,10 @@ else
 fi
 
 # -------------------- UI constants --------------------
-MENU_INNER_WIDTH=60   # box inner width (approx; used only for padding)
-STATUS_FIELD_WIDTH=49 # used in the status line "Status: ...." alignment
-
-strip_ansi() {
-  # remove ANSI escape codes for length calculations
-  sed -r 's/\x1B\[[0-9;]*[mK]//g'
-}
+STATUS_FIELD_WIDTH=49
+strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
 
 pad_to_width() {
-  # $1 = width (visible), $2 = string (may include ANSI)
   local width="$1"
   local s="$2"
   local plain len pad
@@ -67,7 +64,8 @@ STATUS_FILE="${RUNTIME_DIR}/borgbase-status"
 PID_FILE="${RUNTIME_DIR}/borgbase-worker.pid"
 
 # -------------------- Defaults (GitHub-safe placeholders) --------------------
-UI_LANG="${UI_LANG:-de}"
+# UI_LANG can be set by environment or stored in ENV_FILE.
+UI_LANG="${UI_LANG:-}"
 
 REPO="${REPO:-ssh://user@user.repo.borgbase.com/./repo}"  # placeholder
 SRC_DIR="${SRC_DIR:-}"                                    # empty => auto-detect panzerbackup
@@ -84,7 +82,7 @@ PRUNE="${PRUNE:-yes}"
 KEEP_LAST="${KEEP_LAST:-1}"
 
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
-BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-5}"     # worker lock-wait (create/extract/prune/compact)
+BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-5}"           # worker lock-wait
 BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT:-1}" # connection test lock-wait (short; lock => warning)
 
 AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY:-no}" # if yes: ssh-keyscan (optional)
@@ -104,17 +102,6 @@ load_env() {
 
 # -------------------- i18n --------------------
 say() { local de="$1" en="$2"; [[ "${UI_LANG:-de}" == "en" ]] && echo -e "$en" || echo -e "$de"; }
-
-choose_language_prompt() {
-  local in="${UI_LANG:-}"
-  [[ -z "$in" ]] && in="de"
-  read -r -p "Language (de/en) [${in}]: " in || in="${UI_LANG:-de}"
-  case "$in" in
-    en|EN) UI_LANG="en" ;;
-    de|DE|"") UI_LANG="de" ;;
-    *) UI_LANG="de" ;;
-  esac
-}
 
 pause_tty() {
   local msg="${1:-}"
@@ -235,6 +222,89 @@ _ssh_port_opt_from_repo() {
   else
     echo ""
   fi
+}
+
+# -------------------- Env file writer --------------------
+write_env_file() {
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  cat > "$ENV_FILE" <<EOF
+# BorgBase Backup Manager - User config
+# Location: $ENV_FILE
+# Notes:
+# - Keep repo passphrase in PASSPHRASE_FILE (chmod 600). Do NOT store it inline.
+# - Leave SSH_KEY="" to enable auto-detection.
+
+UI_LANG="${UI_LANG:-de}"
+
+REPO="${REPO}"
+SRC_DIR="${SRC_DIR}"
+
+SSH_KEY="${SSH_KEY}"
+PREFERRED_KEY_HINT="${PREFERRED_KEY_HINT}"
+SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS}"
+
+PASSPHRASE_FILE="${PASSPHRASE_FILE}"
+SSH_KEY_PASSPHRASE_FILE="${SSH_KEY_PASSPHRASE_FILE}"
+
+LOG_FILE="${LOG_FILE}"
+
+PRUNE="${PRUNE}"
+KEEP_LAST="${KEEP_LAST}"
+
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT}"
+BORG_LOCK_WAIT="${BORG_LOCK_WAIT}"
+BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT}"
+
+AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY}"
+AUTO_TEST_SSH="${AUTO_TEST_SSH}"
+AUTO_TEST_REPO="${AUTO_TEST_REPO}"
+EOF
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+# -------------------- Startup language selector (FIXED) --------------------
+# Always prompt on interactive runs before showing the menu.
+# Default is current UI_LANG (from env/ENV_FILE), fallback de.
+startup_language_selector_force() {
+  # Only prompt if interactive
+  [[ -t 0 && -t 1 ]] || {
+    [[ -z "${UI_LANG:-}" ]] && UI_LANG="de"
+    return 0
+  }
+
+  local def="${UI_LANG:-de}"
+  case "$def" in
+    de|en) ;;
+    *) def="de" ;;
+  esac
+
+  echo ""
+  echo "============================================================"
+  echo "Language / Sprache"
+  echo "============================================================"
+  echo "1) Deutsch"
+  echo "2) English"
+  echo ""
+
+  local prompt_default="1"
+  [[ "$def" == "en" ]] && prompt_default="2"
+
+  local choice=""
+  while true; do
+    read -r -p "Select / Auswahl [1-2] (default ${prompt_default}): " choice || choice="$prompt_default"
+    [[ -z "$choice" ]] && choice="$prompt_default"
+    case "$choice" in
+      1) UI_LANG="de"; break ;;
+      2) UI_LANG="en"; break ;;
+      de|DE) UI_LANG="de"; break ;;
+      en|EN) UI_LANG="en"; break ;;
+      *) echo "Invalid / Ungültig. Please choose 1 or 2." ;;
+    esac
+  done
+
+  # Persist selection (so default next time is remembered), but only if config dir is writable.
+  write_env_file >/dev/null 2>&1 || true
+  return 0
 }
 
 # -------------------- Panzerbackup SRC auto-detection --------------------
@@ -544,7 +614,6 @@ test_ssh_auth() {
 }
 
 is_lock_timeout_output() {
-  # borg lock timeout typical messages
   grep -qiE 'Failed to create/acquire the lock|lock\.exclusive|timeout\)\.|repository is already locked|Could not acquire lock' <<<"$1"
 }
 
@@ -580,13 +649,9 @@ test_connection() {
     return 1
   fi
 
-  # repo test can return:
-  # 0 = OK
-  # 2 = WARN (locked)
-  # 1 = ERROR
   if test_borg_repo; then
     set_status "OK: Verbindung erfolgreich hergestellt."
-    echo -e "${G}Verbindung erfolgreich hergestellt.${NC}"
+    echo -e "${G}$(say 'Verbindung erfolgreich hergestellt.' 'Connection established successfully.')${NC}"
     [[ -n "${SSH_KEY:-}" ]] && echo "SSH_KEY: $SSH_KEY"
     echo "REPO: $REPO"
     return 0
@@ -616,7 +681,7 @@ startup_repo_check() {
   PASSPHRASE_FILE="$(expand_path "${PASSPHRASE_FILE:-$DEFAULT_PASSPHRASE_FILE}")"
   if [[ "$PASSPHRASE_FILE" != /* ]]; then
     PASSPHRASE_FILE="$DEFAULT_PASSPHRASE_FILE"
-    write_env_file
+    write_env_file || true
   fi
 
   if [[ ! -f "$PASSPHRASE_FILE" || ! -s "$PASSPHRASE_FILE" ]]; then
@@ -625,51 +690,8 @@ startup_repo_check() {
     return 0
   fi
 
-  # Silent test -> status is set by test_connection, but never exit script
-  if test_connection >/dev/null 2>&1; then
-    :
-  else
-    :
-  fi
+  if test_connection >/dev/null 2>&1; then :; else :; fi
   return 0
-}
-
-# -------------------- Env file writer --------------------
-write_env_file() {
-  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-  cat > "$ENV_FILE" <<EOF
-# BorgBase Backup Manager - User config
-# Location: $ENV_FILE
-# Notes:
-# - Keep repo passphrase in PASSPHRASE_FILE (chmod 600). Do NOT store it inline.
-# - Leave SSH_KEY="" to enable auto-detection.
-
-UI_LANG="${UI_LANG}"
-
-REPO="${REPO}"
-SRC_DIR="${SRC_DIR}"
-
-SSH_KEY="${SSH_KEY}"
-PREFERRED_KEY_HINT="${PREFERRED_KEY_HINT}"
-SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS}"
-
-PASSPHRASE_FILE="${PASSPHRASE_FILE}"
-SSH_KEY_PASSPHRASE_FILE="${SSH_KEY_PASSPHRASE_FILE}"
-
-LOG_FILE="${LOG_FILE}"
-
-PRUNE="${PRUNE}"
-KEEP_LAST="${KEEP_LAST}"
-
-SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT}"
-BORG_LOCK_WAIT="${BORG_LOCK_WAIT}"
-BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT}"
-
-AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY}"
-AUTO_TEST_SSH="${AUTO_TEST_SSH}"
-AUTO_TEST_REPO="${AUTO_TEST_REPO}"
-EOF
-  chmod 600 "$ENV_FILE" 2>/dev/null || true
 }
 
 # -------------------- Config wizard helpers --------------------
@@ -719,7 +741,8 @@ configure_wizard() {
   echo "$(say 'Konfiguration (Wizard)' 'Configuration (Wizard)')"
   echo "============================================================"
 
-  choose_language_prompt
+  # Language also selectable inside wizard
+  startup_language_selector_force || true
 
   while true; do
     read_line "$(say 'BorgBase Repo URL (ssh://user@host[:port]/./repo)' 'BorgBase repo URL (ssh://user@host[:port]/./repo)')" REPO "$REPO"
@@ -800,7 +823,6 @@ configure_wizard() {
     fi
 
     echo -e "${R}$(say 'Verbindung fehlgeschlagen.' 'Connection failed.')${NC}"
-    echo -e "${Y}$(say 'Wenn die Passphrase falsch ist: bitte erneut eingeben.' 'If passphrase is wrong: please re-enter.')${NC}"
 
     local ans=""
     read -r -p "$(say 'REPO/SSH_KEY ändern? (y/n) ' 'Change REPO/SSH_KEY? (y/n) ')" ans || ans="n"
@@ -835,9 +857,6 @@ follow_log_live() {
   echo "$(say "LOG_FILE: $LOG_FILE" "LOG_FILE: $LOG_FILE")"
   echo ""
 
-  # Clean output:
-  # - convert CR (\r) progress updates to new lines
-  # - drop duplicate consecutive lines (progress spam)
   if command -v stdbuf >/dev/null 2>&1; then
     stdbuf -oL -eL tail -n 200 -f "$LOG_FILE" \
       | sed -u 's/\r/\n/g' \
@@ -1201,7 +1220,6 @@ show_menu() {
 
       3)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
-        # listing often works even if repo is locked; only block on real connectivity problems
         if test_connection; then
           :
         else
@@ -1278,6 +1296,8 @@ cmd="${1:-}"
 
 if [[ -z "$cmd" ]]; then
   load_env || true
+  # FIX: Always prompt on interactive start, even if UI_LANG already set
+  startup_language_selector_force || true
   startup_repo_check || true
   show_menu
   exit 0
@@ -1287,13 +1307,17 @@ load_env || true
 
 case "$cmd" in
   config)
+    startup_language_selector_force || true
     configure_wizard
     ;;
   test)
+    startup_language_selector_force || true
     ensure_config_exists
     if test_connection; then :; else :; fi
     ;;
   upload)
+    # For non-interactive automation: no language prompt unless TTY is present.
+    startup_language_selector_force || true
     ensure_config_exists
     detect_src_dir
     show_upload_selection
@@ -1302,6 +1326,7 @@ case "$cmd" in
     do_upload_background
     ;;
   download)
+    startup_language_selector_force || true
     ensure_config_exists
     detect_src_dir
     if test_connection; then :; else :; fi
@@ -1310,6 +1335,7 @@ case "$cmd" in
     do_download_background "$archive"
     ;;
   list)
+    startup_language_selector_force || true
     ensure_config_exists
     if test_connection; then :; else :; fi
     list_archives
@@ -1318,6 +1344,7 @@ case "$cmd" in
     get_status
     ;;
   menu)
+    startup_language_selector_force || true
     startup_repo_check || true
     show_menu
     ;;
