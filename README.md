@@ -9,12 +9,13 @@ A secure, production-ready backup management tool for uploading and downloading 
 ## 🌟 Features
 
 - **🧙 Interactive Configuration Wizard**: First-run wizard with connection validation and secure credential storage
+- **📊 Dual Status Display**: Separate job and repository connection status in menu
+- **⏱️ Live Runtime Tracking**: Real-time job duration display while operations are running
 - **🌐 Forced Language Selection**: Language prompt on every interactive launch for consistent UX
 - **🔒 Security First**: Per-user config, secure passphrase storage, SSH key authentication
 - **🔑 Smart SSH Key Auto-Detection**: Multi-level discovery from SSH config, standard locations, and custom hints
 - **🛡️ Hard Preflight Gating**: Upload/Download blocked until repository connection is verified
 - **⚠️ Intelligent Lock Handling**: Repository locks treated as warnings (OK if own job running)
-- **📊 Startup Status Check**: Automatic repo connection test on every launch
 - **📺 Live Progress Viewer**: Real-time log following with readable output formatting
 - **🎯 Smart Auto-Detection**: Automatically finds Panzerbackup volumes across multiple mount points
 - **🖥️ Interactive TUI**: User-friendly menu-driven interface with color-coded status display
@@ -85,8 +86,10 @@ After wizard completion, config is stored in:
 └── borgbase-manager.log        # Operation log
 
 ~/.cache/borgbase-backup-manager/  (or /run/user/<uid>/)
-├── borgbase-status             # Current status
-└── borgbase-worker.pid         # Running job PID
+├── borgbase-job-status         # Current job status
+├── borgbase-conn-status        # Repository connection status
+├── borgbase-worker.pid         # Running job PID
+└── borgbase-worker.start       # Job start timestamp
 ```
 
 ### 4. Run
@@ -101,6 +104,7 @@ After wizard completion, config is stored in:
 ./borgbase_manager.sh list
 ./borgbase_manager.sh test        # Test connection
 ./borgbase_manager.sh config      # Re-run wizard
+./borgbase_manager.sh status      # Show both job and connection status
 ```
 
 ## 📖 Usage
@@ -116,8 +120,34 @@ Run the script without arguments to access the interactive menu:
 **On every interactive launch:**
 1. Language selector appears (default: last saved language)
 2. Configuration loaded (if exists)
-3. Repository connection tested (silent)
-4. Main menu displayed with current status
+3. Repository connection tested (silent, updates Repo status)
+4. Main menu displayed with **dual status display**
+
+**Menu Layout:**
+
+```
+╔════════════════════════════════════════════════════════════╗
+║          BorgBase Backup Manager - Hauptmenü               ║
+╠════════════════════════════════════════════════════════════╣
+║  1) Backup zu BorgBase hochladen                           ║
+║  2) Backup von BorgBase herunterladen                      ║
+║  3) Alle Archive auflisten                                 ║
+║  4) Verbindung zum Repo testen                             ║
+║  5) Log-Datei anzeigen                                     ║
+║  6) Einstellungen anzeigen                                 ║
+║  7) Status löschen                                         ║
+║  8) Konfiguration neu (Wizard)                             ║
+║  9) Live Progress (Log folgen)                             ║
+║  q) Beenden                                                ║
+╠════════════════════════════════════════════════════════════╣
+║  Job:    Kein Job aktiv.                                   ║
+║  Repo:   OK: Verbindung erfolgreich hergestellt.           ║
+╚════════════════════════════════════════════════════════════╝
+```
+
+**Dual Status Display:**
+- **Job Status** (top line): Current operation status (upload/download/idle)
+- **Repo Status** (bottom line): Repository connection status
 
 **Menu Options:**
 
@@ -127,9 +157,9 @@ Run the script without arguments to access the interactive menu:
 4. **Test Connection** - Verify repository connection (SSH + Borg)
 5. **View Log** - Display log file in pager (`less`)
 6. **Show Settings** - Display current configuration (shows if passphrase/key files exist)
-7. **Clear Status** - Reset status file
+7. **Clear Status** - Reset both job and connection status files
 8. **Reconfigure (Wizard)** - Re-run configuration wizard
-9. **Live Progress** - Follow log in real-time with readable formatting (NEW!)
+9. **Live Progress** - Follow log in real-time with readable formatting
 10. **Quit** - Exit the manager
 
 ### Command-Line Interface
@@ -153,9 +183,94 @@ Run the script without arguments to access the interactive menu:
 # List all archives
 ./borgbase_manager.sh list
 
-# View current status
+# View current status (both job and connection)
 ./borgbase_manager.sh status
 ```
+
+## 📊 Dual Status Display
+
+### Status Separation
+
+The script maintains **two independent status channels**:
+
+**1. Job Status** (`borgbase-job-status`)
+- **What the script is currently doing**
+- Shows active operations (upload/download) or idle state
+- Includes live runtime tracking during operations
+- Updated by background workers
+
+**2. Connection Status** (`borgbase-conn-status`)
+- **Repository connectivity and authentication state**
+- Updated on startup and during connection tests
+- Persists between operations
+- Independent of job status
+
+### Status Colors
+
+**Color-Coded Display:**
+- 🔴 **Red**: Errors/failures (`FEHLER`, `ERROR`, `failed`)
+- 🟢 **Green**: Success/ready (`OK`, `Abgeschlossen`, `Finished`)
+- 🟡 **Yellow**: Running operations, warnings (`UPLOAD`, `DOWNLOAD`, `WARN`, `locked`, `BUSY`)
+
+### Job Status Messages
+
+**Idle State:**
+- `Kein Job aktiv.` / `No job active.`
+
+**Upload:**
+- `UPLOAD: Start...`
+- `UPLOAD: Suche letztes Backup...` / `UPLOAD: Finding latest backup...`
+- `UPLOAD: Erstelle Archiv Backup-host-2025-01-29_14-30...` / `UPLOAD: Creating archive...`
+- `UPLOAD: Upload läuft (Details via Menü 9 / Log)...` / `UPLOAD: Upload in progress...`
+- `UPLOAD: Prune/Retention läuft...` / `UPLOAD: Pruning old archives...`
+- `UPLOAD: Compact läuft...` / `UPLOAD: Compacting repository...`
+- `UPLOAD: Abgeschlossen - Backup-host-2025-01-29_14-30 (Dauer: 5m 23s)` / `UPLOAD: Finished...`
+
+**Download:**
+- `DOWNLOAD: Start...`
+- `DOWNLOAD: Extrahiere Backup-host-2025-01-25_10-15...` / `DOWNLOAD: Extracting...`
+- `DOWNLOAD: Abgeschlossen - Backup-host-2025-01-25_10-15 (Dauer: 3m 47s)` / `DOWNLOAD: Finished...`
+
+**Errors:**
+- `ERROR: No backup found in source directory`
+- `ERROR: Missing file: panzer_2025-01-29_14-30.sfdisk`
+- `ERROR: Upload failed (see log)`
+
+### Connection Status Messages
+
+**Success:**
+- `OK: Verbindung erfolgreich hergestellt.` / `OK: Connection established successfully.`
+- `OK: Repo erreichbar (BUSY/Lock durch laufenden Job).` / `OK: Repo reachable (BUSY/Lock from running job).`
+
+**Warnings:**
+- `WARNUNG: Repo gesperrt (Lock-Timeout) – später erneut versuchen.` / `WARNING: Repo locked (Lock-Timeout) – try again later.`
+
+**Errors:**
+- `FEHLER: SSH Hostkey Problem (known_hosts).` / `ERROR: SSH Hostkey problem (known_hosts).`
+- `FEHLER: SSH Auth fehlgeschlagen (publickey).` / `ERROR: SSH Auth failed (publickey).`
+- `FEHLER: SSH-Key Passphrase benötigt/falsch.` / `ERROR: SSH-Key passphrase required/wrong.`
+- `FEHLER: SSH Test fehlgeschlagen.` / `ERROR: SSH test failed.`
+- `FEHLER: Repo-Verbindung fehlgeschlagen.` / `ERROR: Repo connection failed.`
+- `FEHLER: Repo-Passphrase fehlt (PASSPHRASE_FILE ungültig/Datei fehlt).` / `ERROR: Missing repo passphrase...`
+
+**Initial:**
+- `Hinweis: Keine Konfiguration gefunden. Bitte Wizard (8) ausführen.` / `Note: No configuration found. Please run Wizard (8).`
+- `Repo/Verbindung: nicht getestet.` / `Repo/connection: not tested.`
+
+### Live Runtime Tracking
+
+**During active operations, job status shows live runtime:**
+
+```
+Job:    UPLOAD: Upload läuft... (5m 23s)
+Repo:   OK: Verbindung erfolgreich hergestellt.
+```
+
+**Runtime is updated in menu:**
+- Calculated from job start timestamp (`borgbase-worker.start`)
+- Format: `XXm YYs` or `XXh YYm ZZs` (includes hours if > 1h)
+- Only shown while job is actually running
+- Cleared when job completes
 
 ## 🔐 Security Architecture
 
@@ -196,7 +311,7 @@ All configuration is stored in **user-specific directories** following XDG Base 
   2. Repository access (`borg info`)
   3. Passphrase correctness
 - Wizard loops until all validation passes
-- Status updated on every script launch
+- Connection status updated on every script launch
 
 **Intelligent Lock Handling:**
 - **Repository locked** → Treated as **WARNING** (not ERROR)
@@ -301,11 +416,11 @@ Before upload, script shows **exact details**:
 ```
 Geplantes Upload-Set (NEUESTES Backup):
   SRC_DIR : /mnt/panzerbackup-pm
-  IMG     : panzer_2025-01-28_14-30-00.img.zst.gpg
-  Datum   : 2025-01-28 14:30:00
+  IMG     : panzer_2025-01-29_14-30-00.img.zst.gpg
+  Datum   : 2025-01-29 14:30:00
   Größe   : 245.67 GiB (263742619648 Bytes)
-  SHA     : panzer_2025-01-28_14-30-00.img.zst.gpg.sha256
-  SFDISK  : panzer_2025-01-28_14-30-00.sfdisk
+  SHA     : panzer_2025-01-29_14-30-00.img.zst.gpg.sha256
+  SFDISK  : panzer_2025-01-29_14-30-00.sfdisk
 ```
 
 **Includes:**
@@ -497,24 +612,37 @@ The manager handles complete Panzerbackup sets:
 
 Archives are named: `Backup-<HOSTNAME>-<TIMESTAMP>`
 
-Example: `Backup-myserver-2025-01-28_14-30`
+Example: `Backup-myserver-2025-01-29_14-30`
 
 ## 📊 Monitoring
 
 ### Status Display
 
-**Color-Coded Status:**
-- 🔴 **Red**: Errors/failures (`FEHLER`, `ERROR`, `failed`)
-- 🟢 **Green**: Success/ready (`OK`, `Abgeschlossen`, `Finished`)
-- 🟡 **Yellow**: Running operations, warnings (`UPLOAD`, `DOWNLOAD`, `WARN`, `locked`, `BUSY`)
+**Dual Status Lines in Menu:**
 
-**Status Messages:**
-- `OK: Verbindung erfolgreich hergestellt` - Connection validated
-- `OK: Repo erreichbar (BUSY/Lock durch laufenden Job)` - Repo locked by own job
-- `WARNUNG: Repo gesperrt (Lock-Timeout)` - Repo locked by other process
-- `FEHLER: Repo-Passphrase fehlt` - Missing passphrase
-- `FEHLER: SSH Auth fehlgeschlagen (publickey)` - SSH authentication failed
-- `UPLOAD: Finished - Backup-host-2025-01-28_14-30 (Duration: 05m:23s)` - Completed
+```
+╠════════════════════════════════════════════════════════════╣
+║  Job:    UPLOAD: Upload läuft... (5m 23s)                  ║
+║  Repo:   OK: Verbindung erfolgreich hergestellt.           ║
+╚════════════════════════════════════════════════════════════╝
+```
+
+**Status Colors:**
+- 🔴 **Red**: Errors/failures
+- 🟢 **Green**: Success/ready
+- 🟡 **Yellow**: Running operations, warnings
+
+**Job Status shows:**
+- Current operation (upload/download)
+- Live runtime (updates in menu while running)
+- Completion messages with total duration
+- Error details
+
+**Repo Status shows:**
+- Connection state (OK/ERROR/WARNING)
+- SSH authentication status
+- Repository lock status
+- Configuration issues
 
 ### Startup Status Check
 
@@ -522,16 +650,17 @@ Example: `Backup-myserver-2025-01-28_14-30`
 1. Language selector appears
 2. Configuration loaded (if exists)
 3. Repository connection tested (silent, non-blocking)
-4. Status set to `OK`, `WARNUNG`, or `FEHLER` with details
-5. Main menu displayed with status in header
+4. **Connection status** updated (Job status preserved)
+5. Main menu displayed with dual status
 
 **Benefits:**
 - Immediate feedback on config validity
 - Early detection of connectivity issues
 - Lock status visible before attempting operations
+- Job status preserved between menu interactions
 - No surprise failures when starting uploads
 
-### Live Progress Viewer (NEW!)
+### Live Progress Viewer
 
 **Menu Option 9: Live Progress (follow log)**
 
@@ -561,13 +690,13 @@ Live progress: following log (cleaned). Exit with Ctrl+C.
 LOG_FILE: /home/user/.local/state/borgbase-backup-manager/borgbase-manager.log
 
 ==========================================
-Worker Start (Upload): 2025-01-28 14:25:22
+Worker Start (Upload): 2025-01-29 14:25:22
 ==========================================
-UPLOAD: Finding latest backup...
-UPLOAD: Creating archive Backup-myhost-2025-01-28_14-30...
-UPLOAD: Upload in progress...
-A /mnt/panzerbackup-pm/panzer_2025-01-28_14-30-00.img.zst.gpg
-A /mnt/panzerbackup-pm/panzer_2025-01-28_14-30-00.img.zst.gpg.sha256
+UPLOAD: Suche letztes Backup...
+UPLOAD: Erstelle Archiv Backup-myhost-2025-01-29_14-30...
+UPLOAD: Upload läuft (Details via Menü 9 / Log)...
+A /mnt/panzerbackup-pm/panzer_2025-01-29_14-30-00.img.zst.gpg
+A /mnt/panzerbackup-pm/panzer_2025-01-29_14-30-00.img.zst.gpg.sha256
 ...
 ```
 
@@ -596,26 +725,21 @@ journalctl -u borgbase-upload.service -f
 
 ```
 ==========================================
-Worker Start (Upload): 2025-01-28 14:25:22
+Worker Start (Upload): 2025-01-29 14:25:22
 ==========================================
 ENV: HOME=/home/user USER=user LOGNAME=user
 ENV: SSH_KEY=/home/user/.ssh/id_ed25519_borgbase
 ENV: SSH_KNOWN_HOSTS=/home/user/.ssh/known_hosts
 ENV: BORG_RSH=ssh -T -o RequestTTY=no ...
 ------------------------------------------
-UPLOAD: Finding latest backup...
-UPLOAD: Creating archive Backup-myhost-2025-01-28_14-30...
-UPLOAD: Upload in progress...
+UPLOAD: Suche letztes Backup...
+UPLOAD: Erstelle Archiv Backup-myhost-2025-01-29_14-30...
+UPLOAD: Upload läuft (Details via Menü 9 / Log)...
 [Borg progress output...]
-UPLOAD: Pruning old archives...
-UPLOAD: Compacting repository...
+UPLOAD: Prune/Retention läuft...
+UPLOAD: Compact läuft...
 ------------------------------------------
-  SUCCESS SUMMARY
-  Archive:  Backup-myhost-2025-01-28_14-30
-  Duration: 05m:23s
-  End:      2025-01-28 14:30:45
-------------------------------------------
-UPLOAD: Finished - Backup-myhost-2025-01-28_14-30 (Duration: 05m:23s)
+UPLOAD: Abgeschlossen - Backup-myhost-2025-01-29_14-30 (Dauer: 5m 23s)
 ==========================================
 ```
 
@@ -637,6 +761,30 @@ UPLOAD: Finished - Backup-myhost-2025-01-28_14-30 (Duration: 05m:23s)
 - ✅ **Process isolation** - background workers run in new sessions (`setsid`)
 
 ## 🐛 Troubleshooting
+
+### Understanding Dual Status
+
+**Menu shows two separate status lines:**
+
+```
+║  Job:    Kein Job aktiv.                                   ║
+║  Repo:   OK: Verbindung erfolgreich hergestellt.           ║
+```
+
+**Job Status** = What the script is doing RIGHT NOW
+- `Kein Job aktiv.` = Idle
+- `UPLOAD: Upload läuft... (5m 23s)` = Active upload with runtime
+- `UPLOAD: Abgeschlossen - ...` = Completed
+
+**Repo Status** = Connectivity/Authentication State
+- `OK: Verbindung erfolgreich...` = All good
+- `WARNUNG: Repo gesperrt...` = Locked (but accessible)
+- `FEHLER: SSH Auth fehlgeschlagen...` = Authentication problem
+
+**Both are independent:**
+- You can have `Job: Kein Job aktiv` + `Repo: FEHLER` → Can't start new jobs
+- You can have `Job: UPLOAD läuft` + `Repo: OK` → Normal operation
+- You can have `Job: Kein Job aktiv` + `Repo: WARNUNG` → OK to start jobs (will wait for lock)
 
 ### Language Selector Appears Every Time
 
@@ -707,6 +855,11 @@ nano ~/.config/borgbase-backup-manager/borg_passphrase
 
 **Message**: "Upload ist gesperrt, solange SSH/Repo nicht erreichbar ist"
 
+**Check Repo Status line:**
+```
+║  Repo:   FEHLER: SSH Auth fehlgeschlagen (publickey).      ║
+```
+
 **Causes:**
 1. **Network down** - Repo host unreachable
 2. **SSH auth failed** - Wrong key or known_hosts issue
@@ -734,22 +887,32 @@ borg info ssh://user@user.repo.borgbase.com/./repo
 
 ### Repository Locked Warning
 
-**Message**: "WARNUNG: Repo gesperrt (Lock-Timeout)"
+**Repo Status shows:**
+```
+║  Repo:   WARNUNG: Repo gesperrt (Lock-Timeout) – später...  ║
+```
 
 This is **normal** if:
 - Another backup is currently running
 - Previous job didn't clean up properly
 
-**Actions:**
-- **If own job running**: Status shows `OK: Repo erreichbar (BUSY/Lock durch laufenden Job)`
-- **If no job running**: Wait for lock to clear, or break lock manually:
+**Check Job Status:**
+```
+║  Job:    UPLOAD: Upload läuft... (15m 42s)                  ║
+```
 
+If own job is running → Status automatically changes to:
+```
+║  Repo:   OK: Repo erreichbar (BUSY/Lock durch laufenden Job).║
+```
+
+**If no job running:**
 ```bash
 # Check for running jobs
 ps aux | grep borg
 ./borgbase_manager.sh status
 
-# View live progress if job is running
+# View live progress
 ./borgbase_manager.sh
 # Select option 9) Live progress
 
@@ -759,6 +922,48 @@ borg break-lock ssh://user@user.repo.borgbase.com/./repo
 # Clear stale PID file
 rm -f ~/.cache/borgbase-backup-manager/borgbase-worker.pid
 ```
+
+### Job Shows Runtime But No Progress
+
+**Job Status shows:**
+```
+║  Job:    UPLOAD: Upload läuft... (25m 13s)                  ║
+```
+
+**But nothing happening?**
+
+```bash
+# Check if process is actually running
+ps aux | grep borg
+
+# View live log
+./borgbase_manager.sh
+# Select option 9) Live progress
+
+# Check log for errors
+less ~/.local/state/borgbase-backup-manager/borgbase-manager.log
+
+# If hung, stop manually
+pkill -9 -f borg-upload-worker
+rm -f ~/.cache/borgbase-backup-manager/borgbase-worker.pid
+rm -f ~/.cache/borgbase-backup-manager/borgbase-worker.start
+```
+
+### Status Not Clearing After Job
+
+**After job completes, menu still shows old status:**
+
+```bash
+# Clear both status files
+./borgbase_manager.sh
+# Select option 7) Clear status
+
+# Or manually
+rm -f ~/.cache/borgbase-backup-manager/borgbase-job-status
+rm -f ~/.cache/borgbase-backup-manager/borgbase-conn-status
+```
+
+**Note:** Status is only auto-cleared when no job is running.
 
 ### Auto-Detection Fails
 
@@ -823,12 +1028,12 @@ which stdbuf
 tail -f ~/.local/state/borgbase-backup-manager/borgbase-manager.log
 ```
 
-### Settings Menu Shows "no" for Existing Files
+### Settings Menu Shows Wrong Status
 
 **Menu shows:**
 ```
-║  SSH_KEY_EXISTS: no                                       ║
-║  PASSFILE_EXISTS: no                                      ║
+║  SSH_KEY_EXISTS: no                                        ║
+║  PASSFILE_EXISTS: no                                       ║
 ```
 
 **Check files exist:**
@@ -865,14 +1070,16 @@ ssh-keyscan -H -p 2222 host >> ~/.ssh/known_hosts
 
 1. **Main Script**: Handles UI, validation, preflight checks
 2. **Worker Scripts**: Execute Borg operations in isolation
-3. **Status Files**: Communication between processes
+3. **Status Files**: Dual-channel communication (job + connection)
 4. **PID Tracking**: Monitor running operations
+5. **Runtime Tracking**: Start timestamp for duration calculation
 
 **Worker Features:**
 - Run in isolated environment (`env -i`)
 - Start in new session (`setsid`)
 - Comprehensive error handling
-- Duration tracking (MM:SS format)
+- Live duration tracking via start timestamp
+- Clear final status messages
 - Self-cleanup on completion
 - Detailed environment logging
 
@@ -894,13 +1101,27 @@ ssh-keyscan -H -p 2222 host >> ~/.ssh/known_hosts
 ```
 Script Start → Language Selector → Load Config → Startup Repo Check
                                                          ↓
+                                          Update CONN status only
+                                          (preserve JOB status)
+                                                         ↓
                                    ┌─────────────────────┴─────────────────────┐
                                    ↓                     ↓                     ↓
-                             Status: OK         Status: WARNUNG          Status: FEHLER
-                                   ↓                     ↓                     ↓
-                          Operations          Operations            Operations
-                            Allowed       Allowed (with warning)       Blocked
+                          Repo: OK           Repo: WARNUNG           Repo: FEHLER
+                             ↓                     ↓                     ↓
+                       Operations         Operations             Operations
+                         Allowed      Allowed (with warning)        Blocked
+                             ↓                     ↓
+                    Job: UPLOAD läuft      Job: DOWNLOAD läuft
+                    (runtime tracking)     (runtime tracking)
+                             ↓                     ↓
+                    Job: Abgeschlossen     Job: Abgeschlossen
 ```
+
+**Dual Status Independence:**
+- Job status: Updated only by workers and menu actions
+- Conn status: Updated by startup check and test operations
+- Both can be viewed/cleared independently
+- Menu preserves job status during connection tests
 
 ## 📝 License
 
@@ -937,6 +1158,7 @@ Shows:
 - SSH key detection process
 - Configuration loading
 - Repository URL parsing
+- Status file updates
 
 ### Custom Retention Policy
 
@@ -1015,7 +1237,7 @@ For automation (systemd, cron):
 # CLI commands are non-interactive (no language prompt)
 ./borgbase_manager.sh upload   # No prompts
 ./borgbase_manager.sh list     # Direct output
-./borgbase_manager.sh status   # Check status
+./borgbase_manager.sh status   # Shows both job and connection status
 ```
 
 **Note**: First-time setup **requires** interactive wizard. CLI mode uses saved `UI_LANG`.
@@ -1033,6 +1255,30 @@ nano ~/.config/borgbase-backup-manager/borgbase-manager.env
 
 # Or per-invocation
 UI_LANG="en" ./borgbase_manager.sh upload
+```
+
+### Monitoring Job Progress
+
+**Method 1: Menu Status (Quick Check)**
+```bash
+# Open menu to see live runtime
+./borgbase_manager.sh
+# Job status shows: "UPLOAD: Upload läuft... (5m 23s)"
+```
+
+**Method 2: Live Progress (Detailed)**
+```bash
+# Follow log in real-time
+./borgbase_manager.sh
+# Select option 9) Live progress
+# See actual Borg output
+```
+
+**Method 3: CLI Status**
+```bash
+# Check status from command line
+./borgbase_manager.sh status
+# Shows both job and connection status
 ```
 
 ## 🙏 Acknowledgments
