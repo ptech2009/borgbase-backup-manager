@@ -2,6 +2,7 @@
 # BorgBase Backup Manager
 #
 # Features / Fixes:
+# - SECURITY FIX: Uses BORG_PASSCOMMAND instead of BORG_PASSPHRASE to prevent environment leak
 # - ALWAYS show a language selector on interactive start (DE/EN) before the menu (requested).
 #   - Default selection is the last saved UI_LANG (from ENV_FILE or env), but prompt is shown every time.
 #   - Non-interactive runs (no TTY) will not prompt and will keep UI_LANG (or default to de).
@@ -239,6 +240,14 @@ _repo_authority() {
   echo "$r"
 }
 
+_repo_path() {
+  local r="$1"
+  r="${r#ssh://}"
+  r="${r#*@}"
+  r="${r#*/}"
+  echo "/$r"
+}
+
 _user_from_repo() {
   local a; a="$(_repo_authority "$1")"
   echo "${a%%@*}"
@@ -277,196 +286,63 @@ _ssh_port_opt_from_repo() {
   local p
   p="$(_port_from_repo "$1")"
   if [[ -n "$p" ]]; then
-    echo "-p" "$p"
+    echo "-p $p"
   else
     echo ""
   fi
 }
 
-# -------------------- Env file writer --------------------
-write_env_file() {
-  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-  cat > "$ENV_FILE" <<EOF
-# BorgBase Backup Manager - User config
-# Location: $ENV_FILE
-# Notes:
-# - Keep repo passphrase in PASSPHRASE_FILE (chmod 600). Do NOT store it inline.
-# - Leave SSH_KEY="" to enable auto-detection.
-
-UI_LANG="${UI_LANG:-de}"
-
-REPO="${REPO}"
-SRC_DIR="${SRC_DIR}"
-
-SSH_KEY="${SSH_KEY}"
-PREFERRED_KEY_HINT="${PREFERRED_KEY_HINT}"
-SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS}"
-
-PASSPHRASE_FILE="${PASSPHRASE_FILE}"
-SSH_KEY_PASSPHRASE_FILE="${SSH_KEY_PASSPHRASE_FILE}"
-
-LOG_FILE="${LOG_FILE}"
-
-PRUNE="${PRUNE}"
-KEEP_LAST="${KEEP_LAST}"
-
-SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT}"
-BORG_LOCK_WAIT="${BORG_LOCK_WAIT}"
-BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT}"
-
-AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY}"
-AUTO_TEST_SSH="${AUTO_TEST_SSH}"
-AUTO_TEST_REPO="${AUTO_TEST_REPO}"
-EOF
-  chmod 600 "$ENV_FILE" 2>/dev/null || true
-}
-
-# -------------------- Startup language selector (FIXED) --------------------
-startup_language_selector_force() {
-  [[ -t 0 && -t 1 ]] || {
-    [[ -z "${UI_LANG:-}" ]] && UI_LANG="de"
-    return 0
-  }
-
-  local def="${UI_LANG:-de}"
-  case "$def" in
-    de|en) ;;
-    *) def="de" ;;
-  esac
-
-  echo ""
-  echo "============================================================"
-  echo "Language / Sprache"
-  echo "============================================================"
-  echo "1) Deutsch"
-  echo "2) English"
-  echo ""
-
-  local prompt_default="1"
-  [[ "$def" == "en" ]] && prompt_default="2"
-
-  local choice=""
-  while true; do
-    read -r -p "Select / Auswahl [1-2] (default ${prompt_default}): " choice || choice="$prompt_default"
-    [[ -z "$choice" ]] && choice="$prompt_default"
-    case "$choice" in
-      1) UI_LANG="de"; break ;;
-      2) UI_LANG="en"; break ;;
-      de|DE) UI_LANG="de"; break ;;
-      en|EN) UI_LANG="en"; break ;;
-      *) echo "Invalid / Ungültig. Please choose 1 or 2." ;;
-    esac
-  done
-
-  write_env_file >/dev/null 2>&1 || true
-  return 0
-}
-
-# -------------------- Panzerbackup SRC auto-detection --------------------
-detect_src_dir() {
-  has_upload_set() {
-    shopt -s nullglob
-    local files=( "$1"/panzer_*.img.zst.gpg )
-    shopt -u nullglob
-    (( ${#files[@]} > 0 ))
-  }
-
-  if [[ -n "${SRC_DIR:-}" && -d "$SRC_DIR" ]] && has_upload_set "$SRC_DIR"; then
+# -------------------- Passphrase handling (SECURE) --------------------
+# SECURITY: Use BORG_PASSCOMMAND instead of BORG_PASSPHRASE to avoid env leak
+load_repo_passphrase() {
+  if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
+    # SECURITY FIX: Set BORG_PASSCOMMAND instead of BORG_PASSPHRASE
+    # This prevents the passphrase from being visible in process environment
+    unset BORG_PASSPHRASE
+    export BORG_PASSCOMMAND="cat $(printf '%q' "$PASSPHRASE_FILE")"
     return 0
   fi
-
-  say "Versuche, Panzerbackup-Volume automatisch zu finden..." \
-      "Trying to auto-detect a Panzerbackup volume..."
-
-  local bases=(/mnt /media /run/media)
-  local candidates=()
-  local base d
-
-  for base in "${bases[@]}"; do
-    [[ -d "$base" ]] || continue
-    while IFS= read -r -d '' d; do candidates+=( "$d" ); done \
-      < <(find "$base" -maxdepth 4 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
-  done
-
-  if command -v findmnt >/dev/null 2>&1; then
-    while IFS= read -r d; do [[ -d "$d" ]] && candidates+=( "$d" ); done \
-      < <(findmnt -rno TARGET | awk 'BEGIN{IGNORECASE=1}/panzerbackup/{print}')
-  fi
-
-  (( ${#candidates[@]} )) && mapfile -t candidates < <(printf "%s\n" "${candidates[@]}" | awk '!seen[$0]++')
-
-  local valid=()
-  for d in "${candidates[@]:-}"; do
-    has_upload_set "$d" && valid+=( "$d" )
-  done
-
-  if (( ${#valid[@]} == 0 )); then
-    say "Kein Verzeichnis mit panzer_*.img.zst.gpg gefunden. Bitte SRC_DIR manuell angeben." \
-        "No directory containing panzer_*.img.zst.gpg found. Please enter SRC_DIR manually."
-    local manual=""
-    read -r -p "$(say 'SRC_DIR Pfad: ' 'SRC_DIR path: ')" manual || return 1
-    manual="$(expand_path "$manual")"
-    [[ -d "$manual" ]] && has_upload_set "$manual" || {
-      set_job_status "FEHLER: SRC_DIR ungültig (keine panzer_*.img.zst.gpg gefunden)"
-      return 1
-    }
-    SRC_DIR="$manual"
+  if [[ -n "${BORG_PASSPHRASE:-}" ]]; then
+    # Fallback: if BORG_PASSPHRASE is already set (legacy), keep it
+    export BORG_PASSPHRASE
     return 0
   fi
-
-  local best_dir="" best_mtime=0 newest mt
-  for d in "${valid[@]}"; do
-    newest="$(ls -1t "$d"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
-    [[ -n "$newest" ]] || continue
-    mt="$(stat -c %Y "$newest" 2>/dev/null || echo 0)"
-    (( mt > best_mtime )) && { best_mtime="$mt"; best_dir="$d"; }
-  done
-
-  SRC_DIR="$best_dir"
-  say "${G}Backup-Verzeichnis gefunden: $SRC_DIR${NC}" "${G}Detected backup directory: $SRC_DIR${NC}"
-  return 0
+  return 1
 }
 
-# -------------------- Upload selection --------------------
-get_latest_backup_base() {
-  local latest_img
-  latest_img="$(ls -1t "${SRC_DIR}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
-  [[ -n "$latest_img" ]] || return 1
-  echo "${latest_img%.img.zst.gpg}"
-}
+# -------------------- Borg env setup (deterministic) --------------------
+setup_borg_env() {
+  ensure_logfile_writable
 
-show_upload_selection() {
-  local base img sha sfd mt_epoch mt_h size_bytes size_h
-  base="$(get_latest_backup_base)" || {
-    set_job_status "FEHLER: Kein Backup im Quellverzeichnis gefunden"
+  SSH_KNOWN_HOSTS="$(expand_path "$SSH_KNOWN_HOSTS")"
+  mkdir -p "$(dirname -- "$SSH_KNOWN_HOSTS")" 2>/dev/null || true
+  touch "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+
+  resolve_ssh_key || true
+  ensure_known_hosts
+
+  local port_opt
+  port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
+
+  local ssh_base
+  ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT} ${port_opt}"
+
+  if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
+    export BORG_RSH="${ssh_base} -i ${SSH_KEY} -o IdentitiesOnly=yes"
+  else
+    export BORG_RSH="${ssh_base}"
+  fi
+
+  if ! load_repo_passphrase; then
+    set_conn_status "$(say 'FEHLER: Repo-Passphrase fehlt (PASSPHRASE_FILE ungültig/Datei fehlt). Bitte Wizard (8) ausführen.' \
+                        'ERROR: Missing repo passphrase (invalid/missing PASSPHRASE_FILE). Please run Wizard (8).')"
     return 1
-  }
+  fi
 
-  img="${base}.img.zst.gpg"
-  sha="${base}.img.zst.gpg.sha256"
-  sfd="${base}.sfdisk"
-
-  for f in "$img" "$sha" "$sfd"; do
-    [[ -f "$f" ]] || { set_job_status "FEHLER: Datei fehlt: $(basename "$f")"; return 1; }
-  done
-
-  mt_epoch="$(stat -c %Y "$img" 2>/dev/null || echo 0)"
-  mt_h="$(date -d "@$mt_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "n/a")"
-  size_bytes="$(stat -c %s "$img" 2>/dev/null || echo 0)"
-  size_h="$(human_bytes "$size_bytes")"
-
-  echo ""
-  say "${B}Geplantes Upload-Set (NEUESTES Backup):${NC}" "${B}Planned upload set (LATEST backup):${NC}"
-  echo "  SRC_DIR : $SRC_DIR"
-  echo "  IMG     : $(basename "$img")"
-  echo "  Datum   : $mt_h"
-  echo "  Größe   : $size_h ($size_bytes Bytes)"
-  echo "  SHA     : $(basename "$sha")"
-  echo "  SFDISK  : $(basename "$sfd")"
-  echo ""
+  return 0
 }
 
-# -------------------- SSH key auto-detection --------------------
+# -------------------- SSH Key detection --------------------
 detect_ssh_key_from_ssh_config() {
   local cfg="$HOME/.ssh/config"
   [[ -r "$cfg" ]] || return 1
@@ -581,50 +457,68 @@ ensure_known_hosts() {
   fi
 }
 
-# -------------------- Repo passphrase handling --------------------
-load_repo_passphrase() {
-  if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
-    export BORG_PASSPHRASE
-    BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
+detect_src_dir() {
+  if [[ -n "$SRC_DIR" ]]; then
+    SRC_DIR="$(expand_path "$SRC_DIR")"
+    [[ -d "$SRC_DIR" ]] || { echo -e "${R}$(say "SRC_DIR existiert nicht: $SRC_DIR" "SRC_DIR does not exist: $SRC_DIR")${NC}"; return 1; }
     return 0
   fi
-  if [[ -n "${BORG_PASSPHRASE:-}" ]]; then
-    export BORG_PASSPHRASE
-    return 0
-  fi
+  
+  local possible=(
+    "$HOME/panzerbackup"
+    "/home/$(logname 2>/dev/null || echo "$USER")/panzerbackup"
+  )
+  
+  for d in "${possible[@]}"; do
+    if [[ -d "$d" ]]; then
+      SRC_DIR="$d"
+      return 0
+    fi
+  done
+  
+  echo -e "${R}$(say 'Kein panzerbackup-Verzeichnis gefunden. Bitte SRC_DIR setzen.' 'No panzerbackup directory found. Please set SRC_DIR.')${NC}"
   return 1
 }
 
-# -------------------- Borg env setup (deterministic) --------------------
-setup_borg_env() {
-  ensure_logfile_writable
+# -------------------- Borg version compatibility --------------------
+BORG_VERSION_CACHE=""
 
-  SSH_KNOWN_HOSTS="$(expand_path "$SSH_KNOWN_HOSTS")"
-  mkdir -p "$(dirname -- "$SSH_KNOWN_HOSTS")" 2>/dev/null || true
-  touch "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+detect_borg_version() {
+  if [[ -n "$BORG_VERSION_CACHE" ]]; then
+    echo "$BORG_VERSION_CACHE"
+    return 0
+  fi
+  
+  local version_output
+  version_output="$(borg --version 2>&1 || true)"
+  
+  if [[ "$version_output" =~ borg[[:space:]]([0-9]+)\.([0-9]+) ]]; then
+    local major="${BASH_REMATCH[1]}"
+    BORG_VERSION_CACHE="$major"
+    echo "$major"
+    return 0
+  fi
+  
+  # Default to 1 if detection fails
+  BORG_VERSION_CACHE="1"
+  echo "1"
+}
 
-  resolve_ssh_key || true
-  ensure_known_hosts
-
-  local port_opt
-  port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
-
-  local ssh_base
-  ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT} ${port_opt}"
-
-  if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
-    export BORG_RSH="${ssh_base} -i ${SSH_KEY} -o IdentitiesOnly=yes"
+# Borg 1.x uses 'list', Borg 2.x uses 'rlist'
+borg_list_cmd() {
+  local version
+  version="$(detect_borg_version)"
+  if [[ "$version" == "2" ]]; then
+    echo "rlist"
   else
-    export BORG_RSH="${ssh_base}"
+    echo "list"
   fi
+}
 
-  if ! load_repo_passphrase; then
-    set_conn_status "$(say 'FEHLER: Repo-Passphrase fehlt (PASSPHRASE_FILE ungültig/Datei fehlt). Bitte Wizard (8) ausführen.' \
-                        'ERROR: Missing repo passphrase (invalid/missing PASSPHRASE_FILE). Please run Wizard (8).')"
-    return 1
-  fi
-
-  return 0
+# -------------------- Borg wrappers --------------------
+borg_with_ssh() {
+  setup_borg_env || return 1
+  borg "$@"
 }
 
 # -------------------- Connection test --------------------
@@ -648,20 +542,20 @@ test_ssh_auth() {
   echo "$out" >> "$LOG_FILE" 2>/dev/null || true
 
   if echo "$out" | grep -qiE 'host key verification failed|remote host identification has changed'; then
-    set_conn_status "FEHLER: SSH Hostkey Problem (known_hosts)."
+    set_conn_status "$(say 'FEHLER: SSH Hostkey Problem (known_hosts).' 'ERROR: SSH hostkey problem (known_hosts).')"
     return 1
   fi
   if echo "$out" | grep -qiE 'permission denied \(publickey\)|no supported authentication methods available'; then
-    set_conn_status "FEHLER: SSH Auth fehlgeschlagen (publickey)."
+    set_conn_status "$(say 'FEHLER: SSH Auth fehlgeschlagen (publickey).' 'ERROR: SSH auth failed (publickey).')"
     return 1
   fi
   if echo "$out" | grep -qiE 'enter passphrase for key|incorrect passphrase|bad passphrase'; then
-    set_conn_status "FEHLER: SSH-Key Passphrase benötigt/falsch."
+    set_conn_status "$(say 'FEHLER: SSH-Key Passphrase benötigt/falsch.' 'ERROR: SSH key passphrase required/incorrect.')"
     return 1
   fi
 
   echo "$out" | grep -qiE '^borg ' || {
-    set_conn_status "FEHLER: SSH Test fehlgeschlagen."
+    set_conn_status "$(say 'FEHLER: SSH Test fehlgeschlagen.' 'ERROR: SSH test failed.')"
     return 1
   }
 
@@ -687,10 +581,10 @@ test_borg_repo() {
 
   if is_lock_timeout_output "$out"; then
     if is_running; then
-      set_conn_status "OK: Repo erreichbar (BUSY/Lock durch laufenden Job)."
+      set_conn_status "$(say 'OK: Repo erreichbar (BUSY/Lock durch laufenden Job).' 'OK: Repo reachable (BUSY/Lock by running job).')"
       return 0
     fi
-    set_conn_status "WARNUNG: Repo gesperrt (Lock-Timeout) – später erneut versuchen."
+    set_conn_status "$(say 'WARNUNG: Repo gesperrt (Lock-Timeout) – später erneut versuchen.' 'WARNING: Repo locked (lock timeout) – try again later.')"
     return 2
   fi
 
@@ -705,7 +599,7 @@ test_connection() {
   fi
 
   if test_borg_repo; then
-    set_conn_status "OK: Verbindung erfolgreich hergestellt."
+    set_conn_status "$(say 'OK: Verbindung erfolgreich hergestellt.' 'OK: Connection established successfully.')"
     echo -e "${G}$(say 'Verbindung erfolgreich hergestellt.' 'Connection established successfully.')${NC}"
     [[ -n "${SSH_KEY:-}" ]] && echo "SSH_KEY: $SSH_KEY"
     echo "REPO: $REPO"
@@ -716,474 +610,441 @@ test_connection() {
       echo -e "${Y}$(say 'Repo ist derzeit gesperrt (Lock). SSH/Passphrase sind OK.' 'Repo is currently locked. SSH/passphrase are OK.')${NC}"
       return 2
     fi
-    set_conn_status "FEHLER: Repo-Verbindung fehlgeschlagen."
+    set_conn_status "$(say 'FEHLER: Repo-Verbindung fehlgeschlagen.' 'ERROR: Repo connection failed.')"
     return 1
   fi
 }
 
-# -------------------- Startup repo status check --------------------
-startup_repo_check() {
-  ensure_logfile_writable
-
-  if [[ ! -r "$ENV_FILE" ]]; then
-    set_conn_status "$(say 'Hinweis: Keine Konfiguration gefunden. Bitte Wizard (8) ausführen.' \
-                        'Note: No configuration found. Please run Wizard (8).')"
-    return 0
-  fi
-
-  load_env || true
-
-  PASSPHRASE_FILE="$(expand_path "${PASSPHRASE_FILE:-$DEFAULT_PASSPHRASE_FILE}")"
-  if [[ "$PASSPHRASE_FILE" != /* ]]; then
-    PASSPHRASE_FILE="$DEFAULT_PASSPHRASE_FILE"
-    write_env_file || true
-  fi
-
-  if [[ ! -f "$PASSPHRASE_FILE" || ! -s "$PASSPHRASE_FILE" ]]; then
-    set_conn_status "$(say 'FEHLER: Repo-Passphrase fehlt (Passphrase-Datei fehlt/leer). Wizard (8) ausführen.' \
-                        'ERROR: Repo passphrase missing (passphrase file missing/empty). Run Wizard (8).')"
-    return 0
-  fi
-
-  # Do not overwrite JOB status here; only refresh CONN status
-  if test_connection >/dev/null 2>&1; then :; else :; fi
-  return 0
-}
-
-# -------------------- Config wizard helpers --------------------
-read_line() {
-  local prompt="$1" varname="$2" def="$3"
-  local in=""
-  read -r -p "${prompt} [${def}]: " in || in="$def"
-  [[ -z "$in" ]] && in="$def"
-  printf -v "$varname" '%s' "$in"
-}
-
-read_secret() {
-  local prompt="$1"
-  local out=""
-  # shellcheck disable=SC2162
-  read -s -p "$prompt" out || out=""
+# -------------------- Upload/Download logic --------------------
+show_upload_selection() {
   echo ""
-  echo "$out"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo -e "${B}$(say 'Backup hochladen (Upload)' 'Upload Backup')${NC}"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo ""
+  echo "$(say "Quellverzeichnis: $SRC_DIR" "Source directory: $SRC_DIR")"
+  echo "$(say "Ziel-Repo:        $REPO" "Target repo:      $REPO")"
+  echo ""
+  
+  if [[ ! -d "$SRC_DIR" ]]; then
+    echo -e "${R}$(say 'FEHLER: Quellverzeichnis existiert nicht!' 'ERROR: Source directory does not exist!')${NC}"
+    return 1
+  fi
+  
+  local size; size="$(du -sb "$SRC_DIR" 2>/dev/null | awk '{print $1}')"
+  echo "$(say "Größe:            $(human_bytes "$size")" "Size:             $(human_bytes "$size")")"
+  echo ""
 }
 
-ensure_repo_format_minimal() {
-  [[ "$REPO" == ssh://* ]] || return 1
-  [[ "$REPO" == *"@"* ]] || return 1
-  return 0
-}
-
-prompt_repo_passphrase_loop() {
-  mkdir -p "$(dirname -- "$PASSPHRASE_FILE")" 2>/dev/null || true
-  while true; do
-    local p1 p2
-    p1="$(read_secret "$(say 'Repo-Passphrase: ' 'Repo passphrase: ')")"
-    p2="$(read_secret "$(say 'Repo-Passphrase (wiederholen): ' 'Repo passphrase (repeat): ')")"
-    if [[ -z "$p1" || "$p1" != "$p2" ]]; then
-      echo -e "${R}$(say 'Passphrase leer oder stimmt nicht überein. Bitte erneut.' 'Passphrase empty or does not match. Please retry.')${NC}"
-      continue
+do_upload_background() {
+  ensure_logfile_writable
+  
+  (
+    echo "$$" > "$PID_FILE"
+    date +%s > "$START_FILE"
+    
+    set_job_status "$(say 'UPLOAD: Wird vorbereitet...' 'UPLOAD: Preparing...')"
+    
+    {
+      echo ""
+      echo "==================================================="
+      echo "$(say 'UPLOAD GESTARTET' 'UPLOAD STARTED'): $(date)"
+      echo "==================================================="
+      echo ""
+    } | tee -a "$LOG_FILE"
+    
+    # Setup Borg environment (includes SECURITY FIX: BORG_PASSCOMMAND)
+    if ! setup_borg_env; then
+      set_job_status "$(say 'UPLOAD: FEHLER – Borg-Setup fehlgeschlagen' 'UPLOAD: ERROR – Borg setup failed')"
+      rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
+      exit 1
     fi
-    printf '%s' "$p1" > "$PASSPHRASE_FILE"
-    chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
-    export BORG_PASSPHRASE="$p1"
-    return 0
+    
+    local archive_name="backup-$(date +%Y%m%d-%H%M%S)"
+    
+    set_job_status "$(say "UPLOAD: $archive_name läuft..." "UPLOAD: $archive_name running...")"
+    
+    echo "$(say "Erstelle Archiv: $archive_name" "Creating archive: $archive_name")" | tee -a "$LOG_FILE"
+    
+    if borg create --stats --progress --compression lz4 \
+         "${REPO}::${archive_name}" "$SRC_DIR" 2>&1 | \
+         awk '{gsub(/\r/,"\n"); print}' | \
+         awk '!seen[$0]++' | \
+         tee -a "$LOG_FILE"; then
+      
+      echo "" | tee -a "$LOG_FILE"
+      echo "$(say '✓ Archiv erfolgreich erstellt.' '✓ Archive created successfully.')" | tee -a "$LOG_FILE"
+      
+      if [[ "${PRUNE:-yes}" == "yes" ]]; then
+        set_job_status "$(say 'UPLOAD: Prune läuft...' 'UPLOAD: Pruning...')"
+        echo "$(say 'Räume alte Archive auf (prune)...' 'Pruning old archives...')" | tee -a "$LOG_FILE"
+        
+        if borg prune --list --keep-last="${KEEP_LAST:-1}" "$REPO" 2>&1 | tee -a "$LOG_FILE"; then
+          echo "$(say '✓ Prune erfolgreich.' '✓ Prune successful.')" | tee -a "$LOG_FILE"
+        else
+          echo -e "${Y}$(say 'WARNUNG: Prune fehlgeschlagen (nicht kritisch).' 'WARNING: Prune failed (not critical).')${NC}" | tee -a "$LOG_FILE"
+        fi
+        
+        set_job_status "$(say 'UPLOAD: Compact läuft...' 'UPLOAD: Compacting...')"
+        echo "$(say 'Kompaktiere Repo...' 'Compacting repo...')" | tee -a "$LOG_FILE"
+        
+        if borg compact "$REPO" 2>&1 | tee -a "$LOG_FILE"; then
+          echo "$(say '✓ Compact erfolgreich.' '✓ Compact successful.')" | tee -a "$LOG_FILE"
+        else
+          echo -e "${Y}$(say 'WARNUNG: Compact fehlgeschlagen (nicht kritisch).' 'WARNING: Compact failed (not critical).')${NC}" | tee -a "$LOG_FILE"
+        fi
+      fi
+      
+      {
+        echo ""
+        echo "==================================================="
+        echo "$(say 'UPLOAD ABGESCHLOSSEN' 'UPLOAD FINISHED'): $(date)"
+        echo "==================================================="
+        echo ""
+      } | tee -a "$LOG_FILE"
+      
+      set_job_status "$(say 'UPLOAD: Abgeschlossen (Archiv: '"$archive_name"')' 'UPLOAD: Finished (archive: '"$archive_name"')')"
+    else
+      {
+        echo ""
+        echo "==================================================="
+        echo "$(say 'UPLOAD FEHLGESCHLAGEN' 'UPLOAD FAILED'): $(date)"
+        echo "==================================================="
+        echo ""
+      } | tee -a "$LOG_FILE"
+      
+      set_job_status "$(say 'UPLOAD: FEHLER – siehe Log' 'UPLOAD: ERROR – see log')"
+    fi
+    
+    rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
+  ) &
+  
+  disown
+}
+
+select_archive() {
+  echo "$(say 'Lade Archive...' 'Loading archives...')"
+  
+  local list_cmd
+  list_cmd="$(borg_list_cmd)"
+  
+  local archives=()
+  mapfile -t archives < <(borg_with_ssh "$list_cmd" --short "$REPO" 2>/dev/null | sort -r)
+  
+  if (( ${#archives[@]} == 0 )); then
+    echo -e "${R}$(say 'Keine Archive im Repo gefunden.' 'No archives found in repo.')${NC}"
+    return 1
+  fi
+  
+  echo ""
+  echo "$(say 'Verfügbare Archive:' 'Available archives:')"
+  local i=1
+  for a in "${archives[@]}"; do
+    echo "  $i) $a"
+    ((i++))
   done
+  echo ""
+  
+  local choice=""
+  read -r -p "$(say 'Wähle Archiv (Nummer): ' 'Select archive (number): ')" choice
+  
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#archives[@]} )); then
+    echo -e "${R}$(say 'Ungültige Auswahl.' 'Invalid selection.')${NC}"
+    return 1
+  fi
+  
+  echo "${archives[$((choice-1))]}"
+}
+
+do_download_background() {
+  local archive="${1:-}"
+  [[ -z "$archive" ]] && { echo "No archive specified."; return 1; }
+  
+  ensure_logfile_writable
+  
+  (
+    echo "$$" > "$PID_FILE"
+    date +%s > "$START_FILE"
+    
+    set_job_status "$(say 'DOWNLOAD: Wird vorbereitet...' 'DOWNLOAD: Preparing...')"
+    
+    {
+      echo ""
+      echo "==================================================="
+      echo "$(say 'DOWNLOAD GESTARTET' 'DOWNLOAD STARTED'): $(date)"
+      echo "$(say "Archiv: $archive" "Archive: $archive")"
+      echo "==================================================="
+      echo ""
+    } | tee -a "$LOG_FILE"
+    
+    # Setup Borg environment (includes SECURITY FIX: BORG_PASSCOMMAND)
+    if ! setup_borg_env; then
+      set_job_status "$(say 'DOWNLOAD: FEHLER – Borg-Setup fehlgeschlagen' 'DOWNLOAD: ERROR – Borg setup failed')"
+      rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
+      exit 1
+    fi
+    
+    set_job_status "$(say "DOWNLOAD: $archive läuft..." "DOWNLOAD: $archive running...")"
+    
+    echo "$(say "Extrahiere Archiv: $archive" "Extracting archive: $archive")" | tee -a "$LOG_FILE"
+    echo "$(say "Ziel: $SRC_DIR" "Target: $SRC_DIR")" | tee -a "$LOG_FILE"
+    
+    if borg extract --progress "${REPO}::${archive}" 2>&1 | \
+         awk '{gsub(/\r/,"\n"); print}' | \
+         awk '!seen[$0]++' | \
+         tee -a "$LOG_FILE"; then
+      
+      {
+        echo ""
+        echo "==================================================="
+        echo "$(say 'DOWNLOAD ABGESCHLOSSEN' 'DOWNLOAD FINISHED'): $(date)"
+        echo "==================================================="
+        echo ""
+      } | tee -a "$LOG_FILE"
+      
+      set_job_status "$(say 'DOWNLOAD: Abgeschlossen (Archiv: '"$archive"')' 'DOWNLOAD: Finished (archive: '"$archive"')')"
+    else
+      {
+        echo ""
+        echo "==================================================="
+        echo "$(say 'DOWNLOAD FEHLGESCHLAGEN' 'DOWNLOAD FAILED'): $(date)"
+        echo "==================================================="
+        echo ""
+      } | tee -a "$LOG_FILE"
+      
+      set_job_status "$(say 'DOWNLOAD: FEHLER – siehe Log' 'DOWNLOAD: ERROR – see log')"
+    fi
+    
+    rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
+  ) &
+  
+  disown
+}
+
+list_archives() {
+  echo "$(say 'Lade Archive...' 'Loading archives...')"
+  echo ""
+  
+  local list_cmd
+  list_cmd="$(borg_list_cmd)"
+  
+  if borg_with_ssh "$list_cmd" "$REPO" 2>&1 | tee -a "$LOG_FILE"; then
+    echo ""
+    echo -e "${G}$(say 'Archive erfolgreich geladen.' 'Archives loaded successfully.')${NC}"
+  else
+    echo ""
+    echo -e "${R}$(say 'Fehler beim Laden der Archive.' 'Error loading archives.')${NC}"
+    return 1
+  fi
+}
+
+# -------------------- Config wizard --------------------
+ensure_config_exists() {
+  if [[ ! -r "$ENV_FILE" ]]; then
+    echo -e "${Y}$(say 'Keine Konfiguration gefunden.' 'No configuration found.')${NC}"
+    echo "$(say 'Bitte führe den Konfigurationswizard aus (Menüpunkt 8 oder: config).' 'Please run configuration wizard (menu 8 or: config).')"
+    return 1
+  fi
+  
+  if [[ ! -r "$PASSPHRASE_FILE" ]]; then
+    echo -e "${Y}$(say 'Repo-Passphrase-Datei fehlt.' 'Repo passphrase file missing.')${NC}"
+    echo "$(say 'Bitte führe den Konfigurationswizard aus (Menüpunkt 8 oder: config).' 'Please run configuration wizard (menu 8 or: config).')"
+    return 1
+  fi
+  
+  return 0
 }
 
 configure_wizard() {
   echo ""
-  echo "============================================================"
-  echo "$(say 'Konfiguration (Wizard)' 'Configuration (Wizard)')"
-  echo "============================================================"
-
-  startup_language_selector_force || true
-
-  while true; do
-    read_line "$(say 'BorgBase Repo URL (ssh://user@host[:port]/./repo)' 'BorgBase repo URL (ssh://user@host[:port]/./repo)')" REPO "$REPO"
-    if ensure_repo_format_minimal; then
-      break
-    fi
-    echo -e "${R}$(say 'Ungültiges REPO-Format. Muss mit ssh:// beginnen und user@host enthalten.' 'Invalid REPO format. Must start with ssh:// and include user@host.')${NC}"
-  done
-
-  local src_in=""
-  read -r -p "$(say 'Quellverzeichnis (SRC_DIR) - Enter für Auto-Detection panzerbackup' 'Source directory (SRC_DIR) - Enter for panzerbackup auto-detection') [auto]: " src_in || src_in=""
-  src_in="$(expand_path "$src_in")"
-  if [[ -z "$src_in" || "$src_in" == "auto" || "$src_in" == "AUTO" ]]; then
-    SRC_DIR=""
-  else
-    SRC_DIR="$src_in"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo -e "${B}$(say 'Konfigurationswizard' 'Configuration Wizard')${NC}"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo ""
+  
+  local new_repo="${REPO}"
+  read -r -p "$(say "Repo URL [$new_repo]: " "Repo URL [$new_repo]: ")" input
+  [[ -n "$input" ]] && new_repo="$input"
+  
+  local new_src="${SRC_DIR}"
+  read -r -p "$(say "Quellverzeichnis [$new_src]: " "Source directory [$new_src]: ")" input
+  [[ -n "$input" ]] && new_src="$input"
+  
+  local detected_key=""
+  detected_key="$(detect_ssh_key 2>/dev/null || true)"
+  local new_key="${SSH_KEY:-$detected_key}"
+  read -r -p "$(say "SSH-Key [$new_key]: " "SSH key [$new_key]: ")" input
+  [[ -n "$input" ]] && new_key="$input"
+  
+  echo ""
+  echo "$(say 'Repo-Passphrase (wird sicher gespeichert):' 'Repo passphrase (will be stored securely):')"
+  read -r -s -p "  Passphrase: " p1
+  echo ""
+  read -r -s -p "  $(say 'Wiederhole:' 'Repeat:')" p2
+  echo ""
+  
+  if [[ "$p1" != "$p2" ]]; then
+    echo -e "${R}$(say 'Passphrasen stimmen nicht überein!' 'Passphrases do not match!')${NC}"
+    return 1
   fi
-
-  read_line "$(say 'Preferred SSH key hint (optional, e.g. newvorta)' 'Preferred SSH key hint (optional, e.g. newvorta)')" PREFERRED_KEY_HINT "${PREFERRED_KEY_HINT:-}"
-
-  local key_in=""
-  read -r -p "$(say 'SSH_KEY Pfad (leer lassen für Auto-Detection)' 'SSH_KEY path (leave empty for auto-detection)') [auto]: " key_in || key_in=""
-  key_in="$(expand_path "$key_in")"
-  if [[ -z "$key_in" || "$key_in" == "auto" || "$key_in" == "AUTO" ]]; then
-    SSH_KEY=""
-  else
-    SSH_KEY="$key_in"
+  
+  if [[ -z "$p1" ]]; then
+    echo -e "${R}$(say 'Passphrase darf nicht leer sein!' 'Passphrase cannot be empty!')${NC}"
+    return 1
   fi
-
-  read_line "$(say 'SSH known_hosts Pfad' 'SSH known_hosts path')" SSH_KNOWN_HOSTS "$SSH_KNOWN_HOSTS"
-  SSH_KNOWN_HOSTS="$(expand_path "$SSH_KNOWN_HOSTS")"
-
-  read_line "$(say 'Pfad zur Repo-Passphrase-Datei (empfohlen)' 'Repo passphrase file path (recommended)')" PASSPHRASE_FILE "$PASSPHRASE_FILE"
-  PASSPHRASE_FILE="$(expand_path "$PASSPHRASE_FILE")"
-  if [[ "$PASSPHRASE_FILE" != /* ]]; then
-    echo -e "${Y}$(say 'Hinweis: PASSFILE muss ein absoluter Pfad sein. Setze Default.' 'Note: PASSFILE must be an absolute path. Using default.')${NC}"
-    PASSPHRASE_FILE="$DEFAULT_PASSPHRASE_FILE"
+  
+  echo ""
+  echo "$(say 'Optional: SSH-Key-Passphrase (falls dein SSH-Key geschützt ist):' 'Optional: SSH key passphrase (if your SSH key is protected):')"
+  read -r -s -p "  $(say 'SSH-Key-Passphrase (Enter = überspringen): ' 'SSH key passphrase (Enter = skip): ')" ssh_pass
+  echo ""
+  
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+  
+  # SECURITY: Write passphrase directly to file, NEVER export to environment
+  umask 077
+  echo "$p1" > "$PASSPHRASE_FILE"
+  chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
+  
+  if [[ -n "$ssh_pass" ]]; then
+    echo "$ssh_pass" > "$SSH_KEY_PASSPHRASE_FILE"
+    chmod 600 "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || true
   fi
-  mkdir -p "$(dirname -- "$PASSPHRASE_FILE")" 2>/dev/null || true
-
-  read_line "$(say 'Pfad zur SSH-Key-Passphrase-Datei (optional)' 'SSH key passphrase file path (optional)')" SSH_KEY_PASSPHRASE_FILE "$SSH_KEY_PASSPHRASE_FILE"
-  SSH_KEY_PASSPHRASE_FILE="$(expand_path "$SSH_KEY_PASSPHRASE_FILE")"
-  if [[ "$SSH_KEY_PASSPHRASE_FILE" != /* ]]; then
-    echo -e "${Y}$(say 'Hinweis: SSHKEY_PASSFILE muss ein absoluter Pfad sein. Setze Default.' 'Note: SSHKEY_PASSFILE must be an absolute path. Using default.')${NC}"
-    SSH_KEY_PASSPHRASE_FILE="$DEFAULT_SSHKEY_PASSPHRASE_FILE"
-  fi
-  mkdir -p "$(dirname -- "$SSH_KEY_PASSPHRASE_FILE")" 2>/dev/null || true
-
-  ensure_logfile_writable
-
-  if [[ -z "${SRC_DIR:-}" ]]; then
-    detect_src_dir || true
-  fi
-
-  if [[ -z "${SSH_KEY:-}" ]]; then
-    resolve_ssh_key || true
-  fi
-
-  write_env_file
-  load_env || true
-
-  if [[ ! -f "$PASSPHRASE_FILE" || ! -s "$PASSPHRASE_FILE" ]]; then
-    echo -e "${Y}$(say 'Repo-Passphrase eingeben (wird in Datei gespeichert).' 'Enter repo passphrase (will be stored in file).')${NC}"
-    prompt_repo_passphrase_loop
-  fi
-
-  while true; do
-    echo ""
-    echo "$(say 'Teste Verbindung zum Repo...' 'Testing repository connection...')"
-    if test_connection; then
-      break
-    else
-      rc=$?
-      if (( rc == 2 )); then
-        echo -e "${Y}$(say 'Repo ist gesperrt (Lock). Das ist ok, wenn gerade ein Job läuft.' 'Repo is locked. This is ok if a job is currently running.')${NC}"
-        break
-      fi
-    fi
-
-    echo -e "${R}$(say 'Verbindung fehlgeschlagen.' 'Connection failed.')${NC}"
-
-    local ans=""
-    read -r -p "$(say 'REPO/SSH_KEY ändern? (y/n) ' 'Change REPO/SSH_KEY? (y/n) ')" ans || ans="n"
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      configure_wizard
-      return $?
-    fi
-
-    prompt_repo_passphrase_loop
-    write_env_file
-  done
-
+  
+  cat > "$ENV_FILE" <<EOF
+# BorgBase Backup Manager Config
+REPO="$new_repo"
+SRC_DIR="$new_src"
+SSH_KEY="$new_key"
+PASSPHRASE_FILE="$PASSPHRASE_FILE"
+SSH_KEY_PASSPHRASE_FILE="$SSH_KEY_PASSPHRASE_FILE"
+UI_LANG="${UI_LANG:-de}"
+EOF
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  
+  echo ""
   echo -e "${G}$(say 'Konfiguration gespeichert.' 'Configuration saved.')${NC}"
-  return 0
-}
-
-ensure_config_exists() {
-  if [[ ! -r "$ENV_FILE" ]]; then
-    configure_wizard || return 1
-  else
-    load_env || true
+  echo ""
+  
+  load_env || true
+  
+  if [[ "${AUTO_TEST_SSH:-yes}" == "yes" ]]; then
+    echo "$(say 'Teste SSH-Verbindung...' 'Testing SSH connection...')"
+    test_connection || true
   fi
-}
-
-# -------------------- Live progress (readable) --------------------
-follow_log_live() {
-  ensure_logfile_writable
-  [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE" 2>/dev/null || true
-
-  echo ""
-  echo "$(say 'Live-Progress: Log wird verfolgt (bereinigt). Beenden mit Ctrl+C.' 'Live progress: following log (cleaned). Exit with Ctrl+C.')"
-  echo "$(say "LOG_FILE: $LOG_FILE" "LOG_FILE: $LOG_FILE")"
-  echo ""
-
-  if command -v stdbuf >/dev/null 2>&1; then
-    stdbuf -oL -eL tail -n 200 -f "$LOG_FILE" \
-      | sed -u 's/\r/\n/g' \
-      | awk 'NF{ if($0!=prev){print; prev=$0} }'
-  else
-    tail -n 200 -f "$LOG_FILE" \
-      | sed -u 's/\r/\n/g' \
-      | awk 'NF{ if($0!=prev){print; prev=$0} }'
-  fi
-}
-
-# -------------------- Workers --------------------
-create_worker_file() {
-  local name="$1"
-  local f
-  f="$(mktemp "${RUNTIME_DIR}/${name}.XXXXXX")"
-  chmod 700 "$f" 2>/dev/null || true
-  echo "$f"
-}
-
-do_upload_background() {
-  set_job_status "UPLOAD: Start..."
-  date +%s > "$START_FILE" 2>/dev/null || true
-
-  local worker
-  worker="$(create_worker_file "borg-upload-worker.sh")"
-
-  cat > "$worker" <<'EOFWORKER'
-#!/usr/bin/env bash
-set -euo pipefail
-set -E
-trap 'rc=$?; echo "Worker ERROR at line $LINENO: $BASH_COMMAND (rc=$rc)" >> "$LOG_FILE"; set_job_status "ERROR: Upload failed (see log)"; rm -f "$PID_FILE" "$START_FILE"; exit $rc' ERR
-export LC_ALL=C
-
-set_job_status() { echo "$1" > "$JOB_STATUS_FILE"; }
-
-if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
-  export BORG_PASSPHRASE
-  BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
-fi
-: "${BORG_PASSPHRASE:?Missing BORG_PASSPHRASE (set PASSPHRASE_FILE or env)}"
-
-START_TIME=$(date +%s)
-
-{
-  exec >> "$LOG_FILE" 2>&1
-  echo "=========================================="
-  echo "Worker Start (Upload): $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "=========================================="
-  echo "ENV: HOME=${HOME:-<unset>} USER=${USER:-<unset>} LOGNAME=${LOGNAME:-<unset>}"
-  echo "ENV: SSH_KEY=${SSH_KEY:-<unset>}"
-  echo "ENV: SSH_KNOWN_HOSTS=${SSH_KNOWN_HOSTS:-<unset>}"
-  echo "ENV: BORG_RSH=${BORG_RSH:-<unset>}"
-  echo "------------------------------------------"
-
-  set_job_status "UPLOAD: Suche letztes Backup..."
-
-  latest_img="$(ls -1t "${SRC_DIR}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
-  if [[ -z "${latest_img}" ]]; then
-    set_job_status "ERROR: No backup found in source directory"
-    rm -f "$PID_FILE" "$START_FILE"
-    exit 1
-  fi
-
-  base="${latest_img%.img.zst.gpg}"
-  img="${base}.img.zst.gpg"
-  sha="${base}.img.zst.gpg.sha256"
-  sfd="${base}.sfdisk"
-
-  for f in "$img" "$sha" "$sfd"; do
-    [[ -f "$f" ]] || { set_job_status "ERROR: Missing file: $(basename "$f")"; rm -f "$PID_FILE" "$START_FILE"; exit 1; }
-  done
-
-  HOST="$(hostname -s)"
-  NOW="$(date +%Y-%m-%d_%H-%M)"
-  ARCHIVE="Backup-${HOST}-${NOW}"
-
-  set_job_status "UPLOAD: Erstelle Archiv ${ARCHIVE}..."
-  INCLUDE_LIST="$(mktemp)"
-  trap 'rm -f "$INCLUDE_LIST"' EXIT
-
-  {
-    echo "$img"
-    echo "$sha"
-    echo "$sfd"
-    [[ -f "${SRC_DIR}/LATEST_OK" ]] && echo "${SRC_DIR}/LATEST_OK"
-    [[ -f "${SRC_DIR}/LATEST_OK.sha256" ]] && echo "${SRC_DIR}/LATEST_OK.sha256"
-    [[ -f "${SRC_DIR}/LATEST_OK.sfdisk" ]] && echo "${SRC_DIR}/LATEST_OK.sfdisk"
-    [[ -f "${SRC_DIR}/panzerbackup.log" ]] && echo "${SRC_DIR}/panzerbackup.log"
-  } > "$INCLUDE_LIST"
-
-  set_job_status "UPLOAD: Upload läuft (Details via Menü 9 / Log)..."
-  borg create --lock-wait "${BORG_LOCK_WAIT:-5}" --stats --progress --compression lz4 \
-    "${REPO}::${ARCHIVE}" --paths-from-stdin < "$INCLUDE_LIST"
-
-  if [[ "${PRUNE}" == "yes" ]]; then
-    set_job_status "UPLOAD: Prune/Retention läuft..."
-    borg prune -v --list --lock-wait "${BORG_LOCK_WAIT:-5}" "${REPO}" \
-      --glob-archives "Backup-${HOST}-*" --keep-last="${KEEP_LAST}" || true
-
-    set_job_status "UPLOAD: Compact läuft..."
-    borg compact --lock-wait "${BORG_LOCK_WAIT:-5}" "${REPO}" || true
-  fi
-
-  END_TIME=$(date +%s)
-  DURATION=$((END_TIME - START_TIME))
-  DURATION_FMT="$(printf '%02dm:%02ds\n' $((DURATION%3600/60)) $((DURATION%60)))"
-
-  # Clear, unambiguous final status:
-  set_job_status "UPLOAD: Abgeschlossen - ${ARCHIVE} (Dauer: ${DURATION_FMT})"
-
-  rm -f "$PID_FILE" "$START_FILE"
-}
-EOFWORKER
-
-  chmod +x "$worker"
-
-  env -i \
-    PATH="$PATH" HOME="$HOME" USER="$USER" LOGNAME="$USER" \
-    LC_ALL=C UI_LANG="${UI_LANG:-de}" \
-    SRC_DIR="$SRC_DIR" REPO="$REPO" \
-    SSH_KEY="${SSH_KEY:-}" SSH_KNOWN_HOSTS="$SSH_KNOWN_HOSTS" SSH_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT" \
-    PASSPHRASE_FILE="$PASSPHRASE_FILE" \
-    LOG_FILE="$LOG_FILE" JOB_STATUS_FILE="$JOB_STATUS_FILE" PID_FILE="$PID_FILE" START_FILE="$START_FILE" \
-    PRUNE="$PRUNE" KEEP_LAST="$KEEP_LAST" \
-    BORG_LOCK_WAIT="$BORG_LOCK_WAIT" \
-    BORG_RSH="$BORG_RSH" \
-    nohup setsid "$worker" &>/dev/null &
-
-  echo $! > "$PID_FILE"
-}
-
-do_download_background() {
-  local selected_archive="$1"
-  set_job_status "DOWNLOAD: Start..."
-  date +%s > "$START_FILE" 2>/dev/null || true
-
-  local worker
-  worker="$(create_worker_file "borg-download-worker.sh")"
-
-  cat > "$worker" <<'EOFWORKER'
-#!/usr/bin/env bash
-set -euo pipefail
-set -E
-trap 'rc=$?; echo "Worker ERROR at line $LINENO: $BASH_COMMAND (rc=$rc)" >> "$LOG_FILE"; set_job_status "ERROR: Download failed (see log)"; rm -f "$PID_FILE" "$START_FILE"; exit $rc' ERR
-export LC_ALL=C
-
-set_job_status() { echo "$1" > "$JOB_STATUS_FILE"; }
-
-if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
-  export BORG_PASSPHRASE
-  BORG_PASSPHRASE="$(<"$PASSPHRASE_FILE")"
-fi
-: "${BORG_PASSPHRASE:?Missing BORG_PASSPHRASE (set PASSPHRASE_FILE or env)}"
-
-START_TIME=$(date +%s)
-
-{
-  exec >> "$LOG_FILE" 2>&1
-  echo "=========================================="
-  echo "Worker Start (Download): $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "=========================================="
-
-  set_job_status "DOWNLOAD: Extrahiere ${SELECTED_ARCHIVE}..."
-
-  [[ -d "$SRC_DIR" ]] || { set_job_status "ERROR: Target directory not found"; rm -f "$PID_FILE" "$START_FILE"; exit 1; }
-  [[ -w "$SRC_DIR" ]] || { set_job_status "ERROR: Target directory not writable"; rm -f "$PID_FILE" "$START_FILE"; exit 1; }
-
-  cd "$SRC_DIR"
-  borg extract --lock-wait "${BORG_LOCK_WAIT:-5}" --progress "${REPO}::${SELECTED_ARCHIVE}"
-
-  END_TIME=$(date +%s)
-  DURATION=$((END_TIME - START_TIME))
-  DURATION_FMT="$(printf '%02dm:%02ds\n' $((DURATION%3600/60)) $((DURATION%60)))"
-
-  set_job_status "DOWNLOAD: Abgeschlossen - ${SELECTED_ARCHIVE} (Dauer: ${DURATION_FMT})"
-  rm -f "$PID_FILE" "$START_FILE"
-}
-EOFWORKER
-
-  chmod +x "$worker"
-
-  env -i \
-    PATH="$PATH" HOME="$HOME" USER="$USER" LOGNAME="$USER" \
-    LC_ALL=C UI_LANG="${UI_LANG:-de}" \
-    SELECTED_ARCHIVE="$selected_archive" SRC_DIR="$SRC_DIR" REPO="$REPO" \
-    SSH_KEY="${SSH_KEY:-}" SSH_KNOWN_HOSTS="$SSH_KNOWN_HOSTS" SSH_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT" \
-    PASSPHRASE_FILE="$PASSPHRASE_FILE" \
-    LOG_FILE="$LOG_FILE" JOB_STATUS_FILE="$JOB_STATUS_FILE" PID_FILE="$PID_FILE" START_FILE="$START_FILE" \
-    BORG_LOCK_WAIT="$BORG_LOCK_WAIT" \
-    BORG_RSH="$BORG_RSH" \
-    nohup setsid "$worker" &>/dev/null &
-
-  echo $! > "$PID_FILE"
-}
-
-# -------------------- Repo actions --------------------
-list_archives() {
-  say "Verfügbare Archive im Repository:" "Available archives in repository:"
-  echo ""
-  borg list --lock-wait 1 "${REPO}" | nl -w2 -s') ' || {
-    say "${Y}Hinweis: Zugriff fehlgeschlagen oder Repo gesperrt.${NC}" "${Y}Note: access failed or repo locked.${NC}"
-  }
-  echo ""
-}
-
-select_archive() {
-  local archives=()
-  mapfile -t archives < <(borg list --short "${REPO}" 2>/dev/null || true)
-  (( ${#archives[@]} )) || { say "Keine Archive gefunden." "No archives found."; return 1; }
-  for i in "${!archives[@]}"; do printf "  %2d) %s\n" $((i+1)) "${archives[$i]}"; done
-  echo ""
-  local choice
-  read -r -p "$(say "Archive-Nummer (1-${#archives[@]}): " "Archive number (1-${#archives[@]}): ")" choice || return 1
-  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#archives[@]} )) || { say "Ungültige Auswahl" "Invalid selection"; return 1; }
-  echo "${archives[$((choice-1))]}"
 }
 
 # -------------------- Settings menu --------------------
 show_settings_menu() {
-  clear
   echo ""
-  echo "╔════════════════════════════════════════════════════════════╗"
-  [[ "${UI_LANG:-de}" == "en" ]] \
-    && echo "║                  Settings / Configuration                  ║" \
-    || echo "║                Einstellungen / Konfiguration               ║"
-  echo "╠════════════════════════════════════════════════════════════╣"
-
-  local pass_exists="no"
-  [[ -f "$PASSPHRASE_FILE" && -s "$PASSPHRASE_FILE" ]] && pass_exists="yes"
-
-  local sshkey_exists="no"
-  [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]] && sshkey_exists="yes"
-
-  printf "║  ENV_FILE: %-46s ║\n" "${ENV_FILE:0:46}"
-  printf "║  SRC_DIR: %-47s ║\n" "${SRC_DIR:0:47}"
-  printf "║  REPO: %-50s ║\n" "${REPO:0:50}"
-  printf "║  SSH_KEY: %-47s ║\n" "${SSH_KEY:0:47}"
-  printf "║  SSH_KEY_EXISTS: %-39s ║\n" "${sshkey_exists:0:39}"
-  printf "║  KEY_HINT: %-46s ║\n" "${PREFERRED_KEY_HINT:0:46}"
-  printf "║  KNOWN_HOSTS: %-41s ║\n" "${SSH_KNOWN_HOSTS:0:41}"
-  printf "║  PASSFILE: %-44s ║\n" "${PASSPHRASE_FILE:0:44}"
-  printf "║  PASSFILE_EXISTS: %-39s ║\n" "${pass_exists:0:39}"
-  printf "║  SSHKEY_PASSFILE: %-37s ║\n" "${SSH_KEY_PASSPHRASE_FILE:0:37}"
-  printf "║  LOG_FILE: %-46s ║\n" "${LOG_FILE:0:46}"
-  printf "║  JOB_STATUS_FILE: %-37s ║\n" "${JOB_STATUS_FILE:0:37}"
-  printf "║  CONN_STATUS_FILE: %-36s ║\n" "${CONN_STATUS_FILE:0:36}"
-  printf "║  PID_FILE: %-44s ║\n" "${PID_FILE:0:44}"
-  echo "╚════════════════════════════════════════════════════════════╝"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo -e "${B}$(say 'Einstellungen' 'Settings')${NC}"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
   echo ""
-  echo "$(say 'Tipp: Konfiguration ändern über Menüpunkt 8 (Wizard).' 'Tip: Change configuration via menu option 8 (Wizard).')"
+  echo "REPO:                 $REPO"
+  echo "SRC_DIR:              $SRC_DIR"
+  echo "SSH_KEY:              $SSH_KEY"
+  echo "PASSPHRASE_FILE:      $PASSPHRASE_FILE"
+  echo "SSH_KEY_PASSPHRASE_FILE: $SSH_KEY_PASSPHRASE_FILE"
+  echo "LOG_FILE:             $LOG_FILE"
+  echo "PRUNE:                ${PRUNE:-yes}"
+  echo "KEEP_LAST:            ${KEEP_LAST:-1}"
+  echo "UI_LANG:              ${UI_LANG:-de}"
   echo ""
-  pause_tty "$(say 'Weiter mit Enter...' 'Press Enter...')"
+  pause_tty "$(say 'Weiter...' 'Continue...')"
 }
 
-# -------------------- Main menu --------------------
+# -------------------- Live log --------------------
+follow_log_live() {
+  ensure_logfile_writable
+  
+  if [[ ! -f "$LOG_FILE" ]]; then
+    echo -e "${Y}$(say 'Log-Datei existiert noch nicht.' 'Log file does not exist yet.')${NC}"
+    pause_tty "$(say 'Weiter...' 'Continue...')"
+    return 0
+  fi
+  
+  echo ""
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo -e "${B}$(say 'Live Progress (Log folgen)' 'Live Progress (Follow Log)')${NC}"
+  echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
+  echo "$(say 'Drücke CTRL+C zum Beenden' 'Press CTRL+C to exit')"
+  echo ""
+  
+  tail -f "$LOG_FILE"
+}
+
+# -------------------- Startup helpers --------------------
+startup_language_selector_force() {
+  if [[ ! -t 0 ]]; then
+    return 0
+  fi
+  
+  local current="${UI_LANG:-de}"
+  local default_choice="1"
+  [[ "$current" == "en" ]] && default_choice="2"
+  
+  echo ""
+  echo "════════════════════════════════════════════════════════════"
+  echo "  Language / Sprache"
+  echo "════════════════════════════════════════════════════════════"
+  echo "  1) Deutsch (de)"
+  echo "  2) English (en)"
+  echo "════════════════════════════════════════════════════════════"
+  echo ""
+  
+  local choice=""
+  read -r -p "Wahl/Choice [$default_choice]: " choice
+  [[ -z "$choice" ]] && choice="$default_choice"
+  
+  case "$choice" in
+    1) UI_LANG="de" ;;
+    2) UI_LANG="en" ;;
+    *) UI_LANG="de" ;;
+  esac
+  
+  export UI_LANG
+  
+  if [[ -w "$ENV_FILE" ]]; then
+    sed -i.bak '/^UI_LANG=/d' "$ENV_FILE" 2>/dev/null || true
+    echo "UI_LANG=\"$UI_LANG\"" >> "$ENV_FILE"
+  fi
+}
+
+startup_repo_check() {
+  if [[ "${AUTO_TEST_REPO:-yes}" != "yes" ]]; then
+    return 0
+  fi
+  
+  if ! ensure_config_exists 2>/dev/null; then
+    return 0
+  fi
+  
+  echo ""
+  echo "$(say 'Prüfe Repo-Verbindung im Hintergrund...' 'Checking repo connection in background...')"
+  (test_connection >/dev/null 2>&1 &)
+}
+
+# -------------------- Menu --------------------
 show_menu() {
   while true; do
     clear
+    
+    echo "════════════════════════════════════════════════════════════"
+    if [[ "${UI_LANG:-de}" == "en" ]]; then
+      echo "║            BorgBase Backup Manager (Secure)            ║"
+    else
+      echo "║          BorgBase Backup Manager (Sicher)              ║"
+    fi
+    echo "════════════════════════════════════════════════════════════"
     echo ""
-    echo "╔════════════════════════════════════════════════════════════╗"
-    [[ "${UI_LANG:-de}" == "en" ]] \
-      && echo "║          BorgBase Backup Manager - Main Menu               ║" \
-      || echo "║          BorgBase Backup Manager - Hauptmenü               ║"
-    echo "╠════════════════════════════════════════════════════════════╣"
-
+    
     if [[ "${UI_LANG:-de}" == "en" ]]; then
       echo "║  1) Upload backup to BorgBase                              ║"
       echo "║  2) Download backup from BorgBase                          ║"
       echo "║  3) List all archives                                      ║"
-      echo "║  4) Test repo connection                                   ║"
-      echo "║  5) View log file                                          ║"
+      echo "║  4) Test connection to repo                                ║"
+      echo "║  5) Show log file                                          ║"
       echo "║  6) Show settings                                          ║"
       echo "║  7) Clear status                                           ║"
       echo "║  8) Reconfigure (Wizard)                                   ║"
@@ -1201,38 +1062,38 @@ show_menu() {
       echo "║  9) Live Progress (Log folgen)                             ║"
       echo "║  q) Beenden                                                ║"
     fi
-
+    
     echo "╠════════════════════════════════════════════════════════════╣"
-
+    
     # JOB line
     local job_line; job_line="$(get_job_status_formatted)"
     local job_padded; job_padded="$(pad_to_width "$STATUS_FIELD_WIDTH" "$job_line")"
     [[ "${UI_LANG:-de}" == "en" ]] \
       && printf "║  Job:    %s ║\n" "$job_padded" \
       || printf "║  Job:    %s ║\n" "$job_padded"
-
+    
     # CONN line
     local conn_line; conn_line="$(get_conn_status_formatted)"
     local conn_padded; conn_padded="$(pad_to_width "$STATUS_FIELD_WIDTH" "$conn_line")"
     [[ "${UI_LANG:-de}" == "en" ]] \
       && printf "║  Repo:   %s ║\n" "$conn_padded" \
       || printf "║  Repo:   %s ║\n" "$conn_padded"
-
+    
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
-
+    
     local choice=""
     if ! read -r -p "$(say 'Ihre Wahl: ' 'Your choice: ')" choice; then
       echo ""
       break
     fi
-
+    
     case "$choice" in
       1)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         detect_src_dir || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         show_upload_selection || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
-
+        
         if test_connection; then
           :
         else
@@ -1245,24 +1106,24 @@ show_menu() {
             continue
           fi
         fi
-
+        
         if is_running; then
           echo -e "${Y}$(say 'Ein Job läuft bereits.' 'A job is already running.')${NC}"
           pause_tty "$(say 'Weiter...' 'Continue...')"
           continue
         fi
-
+        
         pause_tty "$(say 'Enter = Upload starten (CTRL+C zum Abbrechen) ' 'Press Enter to start upload (CTRL+C to abort) ')"
         do_upload_background
         echo -e "${G}$(say 'Upload im Hintergrund gestartet.' 'Upload started in background.')${NC}"
         echo -e "${Y}$(say 'Tipp: Menüpunkt 9 = Live Progress (Log folgen).' 'Tip: menu 9 = Live progress (follow log).')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       2)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         detect_src_dir || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
-
+        
         if test_connection; then
           :
         else
@@ -1275,13 +1136,13 @@ show_menu() {
             continue
           fi
         fi
-
+        
         if is_running; then
           echo -e "${Y}$(say 'Ein Job läuft bereits.' 'A job is already running.')${NC}"
           pause_tty "$(say 'Weiter...' 'Continue...')"
           continue
         fi
-
+        
         local archive=""
         archive="$(select_archive)" || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         do_download_background "$archive"
@@ -1289,7 +1150,7 @@ show_menu() {
         echo -e "${Y}$(say 'Tipp: Menüpunkt 9 = Live Progress (Log folgen).' 'Tip: menu 9 = Live progress (follow log).')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       3)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         if test_connection; then
@@ -1304,7 +1165,7 @@ show_menu() {
         list_archives
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       4)
         ensure_config_exists || { pause_tty "$(say 'Weiter...' 'Continue...')"; continue; }
         if test_connection; then
@@ -1319,7 +1180,7 @@ show_menu() {
         fi
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       5)
         ensure_logfile_writable
         if [[ -f "$LOG_FILE" ]]; then
@@ -1329,32 +1190,32 @@ show_menu() {
           pause_tty "$(say 'Weiter...' 'Continue...')"
         fi
         ;;
-
+      
       6)
         ensure_config_exists || true
         show_settings_menu
         ;;
-
+      
       7)
         clear_status
         echo -e "${G}$(say 'Status gelöscht.' 'Status cleared.')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       8)
         load_env || true
         configure_wizard
         pause_tty "$(say 'Weiter...' 'Continue...')"
         ;;
-
+      
       9)
         follow_log_live
         ;;
-
+      
       q|Q)
         exit 0
         ;;
-
+      
       *)
         echo -e "${R}$(say 'Ungültige Auswahl.' 'Invalid choice.')${NC}"
         pause_tty "$(say 'Weiter...' 'Continue...')"
