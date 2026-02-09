@@ -245,7 +245,8 @@ replace_placeholder() {
     local template="$1"
     local placeholder="$2"
     local value="$3"
-    printf '%s' "$template" | sed "s|{${placeholder}}|${value}|g"
+    # Replace both exact {placeholder} and Borg-style variants {placeholder-}, {placeholder_}
+    printf '%s' "$template" | sed -E "s|\{${placeholder}[-_]?\}|${value}|g"
 }
 
 # -------------------- Archive name generation (robust) --------------------
@@ -292,15 +293,15 @@ build_panzer_archive_name() {
     template="$(normalize_panzer_template "${PANZERBACKUP_ARCHIVE_NAME:-panzerbackup-{hostname}-{date}}")"
     name="$template"
 
-    # Replace placeholders if present (optional)
-    if [[ "$name" == *"{hostname}"* ]]; then
+    # Replace placeholders if present (optional) - support Borg-style variants like {hostname-}
+    if [[ "$name" =~ \{hostname[-_]?\} ]]; then
         name="$(replace_placeholder "$name" "hostname" "$host")"
     else
         # Ensure hostname is present
         name="${name}-${host}"
     fi
 
-    if [[ "$name" == *"{date}"* ]]; then
+    if [[ "$name" =~ \{date[-_]?\} ]]; then
         name="$(replace_placeholder "$name" "date" "$ts")"
     else
         # Ensure timestamp is present
@@ -589,7 +590,10 @@ extract_hostname_from_panzerbackup() {
     
     # Extract hostname from pattern: panzer_HOSTNAME-panzerbackup-DATE_...
     # or: panzer_HOSTNAME_DATE_...
-    if [[ "$basename" =~ ^panzer_([^_-]+(?:-[^_-]+)*?)[-_]panzerbackup ]]; then
+    if [[ "$basename" =~ ^panzer_(.+)-panzerbackup ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    elif [[ "$basename" =~ ^panzer_(.+)_panzerbackup ]]; then
         echo "${BASH_REMATCH[1]}"
         return 0
     elif [[ "$basename" =~ ^panzer_([^_]+) ]]; then
@@ -754,22 +758,14 @@ get_archive_prefix_for_source() {
     is_panzerbackup_source "$src_dir" && is_panzer=1
     
     if (( is_panzer )); then
-        # Extract hostname and build archive name from template
+        # Extract hostname
         local hostname_extracted
-        hostname_extracted="$(extract_hostname_from_panzerbackup "$src_dir" 2>/dev/null || hostname 2>/dev/null || echo "unknown")"
+        hostname_extracted="$(extract_hostname_from_panzerbackup "$src_dir" 2>/dev/null || true)"
+        [[ -z "$hostname_extracted" ]] && hostname_extracted="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "unknown")"
+        hostname_extracted="$(sanitize_for_archive_component "$hostname_extracted")"
         
-        # Replace placeholders in template using sed (FIX for bash brace issue)
-        local archive_template="${PANZERBACKUP_ARCHIVE_NAME}"
-        archive_template="$(replace_placeholder "$archive_template" "hostname" "$hostname_extracted")"
-        archive_template="$(replace_placeholder "$archive_template" "date" "")"  # Remove {date} to get prefix
-        
-        # Validate that "panzerbackup" is in the template
-        if ! [[ "$archive_template" =~ [Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp] ]]; then
-            echo -e "${R}$(say 'FEHLER: PANZERBACKUP_ARCHIVE_NAME muss "panzerbackup" enthalten!' 'ERROR: PANZERBACKUP_ARCHIVE_NAME must contain "panzerbackup"!')${NC}" >&2
-            return 1
-        fi
-        
-        echo "$archive_template"
+        # Prefix is always panzerbackup-HOSTNAME (matching how archives are created)
+        echo "panzerbackup-${hostname_extracted}"
         return 0
     else
         # Data backup: use hostname
@@ -886,10 +882,10 @@ interactive_archive_selection() {
         echo -n "$(say "Lösche: $archive ... " "Deleting: $archive ... ")"
         if borg delete "${REPO}::${archive}" 2>&1 | tee -a "$LOG_FILE" >/dev/null; then
             echo -e "${G}✓ OK${NC}"
-            ((deleted_count++))
+            deleted_count=$((deleted_count + 1))
         else
             echo -e "${R}✗ FEHLER${NC}"
-            ((failed_count++))
+            failed_count=$((failed_count + 1))
         fi
     done
     
@@ -1301,7 +1297,7 @@ select_archive() {
     local i=1
     for a in "${archives[@]}"; do
         echo "  $i) $a"
-        ((i++))
+        i=$((i + 1))
     done
     echo ""
     
@@ -1864,10 +1860,10 @@ while true; do
                         pause
                         continue
                     elif (( prune_rc == 2 )); then
-                        # Automatic prune - ask for confirmation
-                        read -r -p "$(say 'Alte Backups wie gezeigt löschen? (j/n): ' 'Delete old backups as shown? (y/n): ')" prune_confirm
-                        if [[ ! "$prune_confirm" =~ ^[jJyY] ]]; then
-                            echo "$(say 'Upload abgebrochen.' 'Upload cancelled.')"
+                        # Automatic prune - ask for strong confirmation (JA/YES)
+                        read -r -p "$(say 'Alte Backups wie gezeigt löschen? (JA zum Bestätigen): ' 'Delete old backups as shown? (type YES to confirm): ')" prune_confirm
+                        if [[ "$prune_confirm" != "JA" && "$prune_confirm" != "YES" ]]; then
+                            echo "$(say 'Löschvorgang abgebrochen. Upload wird nicht gestartet.' 'Deletion cancelled. Upload will not start.')"
                             pause
                             continue
                         fi
