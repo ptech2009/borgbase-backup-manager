@@ -17,6 +17,9 @@
 # - BUGFIX: Fixed placeholder replacement in archive names
 # - BUGFIX: Fixed {hostname}/{date} substitution using sed (bash brace issue)
 # - IMPROVED: Clear log messages after upload/download
+# - IMPROVED: AUTO_ACCEPT_HOSTKEY=yes by default (ssh-keyscan on first connect)
+# - FIXED: Passphrase file is stored in plaintext but protected via chmod 600;
+#          wizard text now correctly states this instead of claiming encryption.
 #
 # Requirements:
 # bash >= 4, borg >= 1.2, ssh, findmnt(optional), ssh-keygen(optional), ssh-keyscan(optional)
@@ -105,7 +108,8 @@ PANZERBACKUP_ARCHIVE_NAME="${PANZERBACKUP_ARCHIVE_NAME:-panzerbackup-{hostname}-
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-60}"
 BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT:-1}"
-AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY:-no}"
+# CHANGED: default is now "yes" so first-time connections work automatically
+AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY:-yes}"
 AUTO_TEST_SSH="${AUTO_TEST_SSH:-yes}"
 AUTO_TEST_REPO="${AUTO_TEST_REPO:-yes}"
 INHIBIT_SLEEP="${INHIBIT_SLEEP:-yes}"          # prevents sleep/idle while worker runs (systemd-inhibit)
@@ -239,24 +243,17 @@ human_bytes() {
 }
 
 # -------------------- Template placeholder replacement --------------------
-# Uses sed to safely replace {hostname} and {date} placeholders.
-# Bash ${var//pattern/replacement} has issues with literal braces.
 replace_placeholder() {
     local template="$1"
     local placeholder="$2"
     local value="$3"
-    # Replace both exact {placeholder} and Borg-style variants {placeholder-}, {placeholder_}
     printf '%s' "$template" | sed -E "s|\{${placeholder}[-_]?\}|${value}|g"
 }
 
 # -------------------- Archive name generation (robust) --------------------
-# Borg interprets "{...}" as placeholders in the target string REPO::ARCHIVE.
-# This manager replaces placeholders itself. Therefore, the final archive name
-# MUST NOT contain any "{" or "}" characters, otherwise borg will try to parse it.
 sanitize_for_archive_component() {
     local s="${1:-}"
     s="${s// /_}"
-    # Keep a safe subset of characters (avoid surprises in repo::archive)
     s="$(printf '%s' "$s" | tr -cs 'A-Za-z0-9._+-' '_' | sed -E 's/^_+//; s/_+$//')"
     [[ -n "$s" ]] || s="unknown"
     echo "$s"
@@ -264,11 +261,9 @@ sanitize_for_archive_component() {
 
 sanitize_archive_name() {
     local name="${1:-}"
-    # Never allow the archive separator sequence or path separators.
     name="${name//::/_}"
     name="${name//\//_}"
     name="${name//\\/__}"
-    # Remove any leftover braces (would be treated as borg placeholders)
     name="${name//\{/_}"
     name="${name//\}/_}"
     name="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9._+-' '_' | sed -E 's/^_+//; s/_+$//')"
@@ -276,7 +271,6 @@ sanitize_archive_name() {
     echo "$name"
 }
 
-# Fix common user template typo: "{hostname-{date}}" -> "{hostname}-{date}"
 normalize_panzer_template() {
     local t="${1:-}"
     t="$(printf '%s' "$t" | sed -E 's/\{hostname[-_ ]*\{date\}\}/\{hostname\}-\{date\}/g')"
@@ -293,22 +287,18 @@ build_panzer_archive_name() {
     template="$(normalize_panzer_template "${PANZERBACKUP_ARCHIVE_NAME:-panzerbackup-{hostname}-{date}}")"
     name="$template"
 
-    # Replace placeholders if present (optional) - support Borg-style variants like {hostname-}
     if [[ "$name" =~ \{hostname[-_]?\} ]]; then
         name="$(replace_placeholder "$name" "hostname" "$host")"
     else
-        # Ensure hostname is present
         name="${name}-${host}"
     fi
 
     if [[ "$name" =~ \{date[-_]?\} ]]; then
         name="$(replace_placeholder "$name" "date" "$ts")"
     else
-        # Ensure timestamp is present
         name="${name}-${ts}"
     fi
 
-    # If braces remain, the template is invalid for this script; fall back.
     if [[ "$name" == *"{"* || "$name" == *"}"* ]]; then
         name="panzerbackup-${host}-${ts}"
     fi
@@ -335,11 +325,9 @@ _ssh_port_opt_from_repo() { local p; p="$(_port_from_repo "$1")"; if [[ -n "$p" 
 
 # -------------------- SSH Agent Management --------------------
 start_ssh_agent_if_needed() {
-    # Check if ssh-agent is already running
     if [[ -n "${SSH_AGENT_PID:-}" ]] && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
         return 0
     fi
-    # Start new ssh-agent
     eval "$(ssh-agent -s)" >/dev/null 2>&1
     return 0
 }
@@ -348,21 +336,16 @@ load_ssh_key_to_agent() {
     [[ -z "${SSH_KEY:-}" ]] && return 0
     [[ ! -r "$SSH_KEY" ]] && return 0
     
-    # Check if key is already loaded
     if ssh-add -l 2>/dev/null | grep -q "$SSH_KEY"; then
         return 0
     fi
     
-    # Try to add key
     if [[ -f "$SSH_KEY_PASSPHRASE_FILE" && -r "$SSH_KEY_PASSPHRASE_FILE" ]]; then
-        # Use passphrase file
         cat "$SSH_KEY_PASSPHRASE_FILE" | SSH_ASKPASS_REQUIRE=never ssh-add "$SSH_KEY" 2>/dev/null || {
-            # Fallback: Try with expect/sshpass or interactive
             DISPLAY=:0 SSH_ASKPASS="$(which ssh-askpass 2>/dev/null || echo /bin/false)" \
                 ssh-add "$SSH_KEY" < "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || return 1
         }
     else
-        # Try without passphrase (will prompt if needed)
         ssh-add "$SSH_KEY" 2>/dev/null || {
             echo -e "${Y}$(say 'SSH-Key hat eine Passphrase.' 'SSH key has a passphrase.')${NC}"
             echo "$(say 'Geben Sie die SSH-Key-Passphrase ein:' 'Enter SSH key passphrase:')"
@@ -372,9 +355,14 @@ load_ssh_key_to_agent() {
     return 0
 }
 
-# -------------------- Passphrase handling (SECURE) --------------------
+# -------------------- Passphrase handling --------------------
+# NOTE: The passphrase file is stored as PLAINTEXT, protected only by
+# file permissions (chmod 600). It is NOT encrypted. Access requires
+# knowing the filesystem path and having the user's/root's credentials.
 load_repo_passphrase() {
     if [[ -n "${PASSPHRASE_FILE:-}" && -f "$PASSPHRASE_FILE" ]]; then
+        # Ensure permissions are tight every time we read it
+        chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
         unset BORG_PASSPHRASE
         export BORG_PASSCOMMAND="cat $(printf '%q' "$PASSPHRASE_FILE")"
         return 0
@@ -394,9 +382,9 @@ setup_borg_env() {
     touch "$SSH_KNOWN_HOSTS" 2>/dev/null || true
     
     resolve_ssh_key || true
+    # Always run ensure_known_hosts so new hosts are added automatically
     ensure_known_hosts
     
-    # Start ssh-agent and load key if it has a passphrase
     if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
         start_ssh_agent_if_needed
         if ! load_ssh_key_to_agent; then
@@ -501,12 +489,17 @@ resolve_ssh_key() {
 }
 
 # -------------------- known_hosts helper --------------------
+# CHANGED: AUTO_ACCEPT_HOSTKEY defaults to "yes".
+# On first connection to a new host, ssh-keyscan fetches and stores the
+# host key automatically. After that, StrictHostKeyChecking=yes verifies it.
+# This means: first connection = trust on first use (TOFU).
+# Subsequent connections = strict verification (no MITM possible after first use).
 ensure_known_hosts() {
     [[ "${AUTO_ACCEPT_HOSTKEY}" == "yes" ]] || return 0
     command -v ssh-keygen >/dev/null 2>&1 || return 0
     command -v ssh-keyscan >/dev/null 2>&1 || return 0
     
-    local host plain_host port host_for_kh
+    local plain_host port host_for_kh
     plain_host="$(_host_from_repo "${REPO}")"
     port="$(_port_from_repo "${REPO}")"
     host_for_kh="$(_knownhosts_host_from_repo "${REPO}")"
@@ -514,33 +507,45 @@ ensure_known_hosts() {
     mkdir -p "$(dirname -- "$SSH_KNOWN_HOSTS")" 2>/dev/null || true
     touch "$SSH_KNOWN_HOSTS" 2>/dev/null || true
     
-    if ssh-keygen -F "$host_for_kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then return 0; fi
-    
-    say "SSH: Hostkey für ${host_for_kh} fehlt..." "SSH: Missing hostkey for ${host_for_kh}..."
-    if [[ -n "$port" ]]; then
-        timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -p "$port" -t ed25519,ecdsa,rsa "$plain_host" >> "$SSH_KNOWN_HOSTS" 2>/dev/null || true
-    else
-        timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -t ed25519,ecdsa,rsa "$plain_host" >> "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+    # Already known? Nothing to do.
+    if ssh-keygen -F "$host_for_kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
+        return 0
     fi
+    
+    say "SSH: Hostkey für ${host_for_kh} fehlt – wird automatisch eingetragen (TOFU)..." \
+        "SSH: Missing hostkey for ${host_for_kh} – adding automatically (TOFU)..."
+    
+    local keyscan_out=""
+    if [[ -n "$port" ]]; then
+        keyscan_out="$(timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -p "$port" -t ed25519,ecdsa,rsa "$plain_host" 2>/dev/null || true)"
+    else
+        keyscan_out="$(timeout "${SSH_CONNECT_TIMEOUT}" ssh-keyscan -H -t ed25519,ecdsa,rsa "$plain_host" 2>/dev/null || true)"
+    fi
+    
+    if [[ -z "$keyscan_out" ]]; then
+        echo -e "${R}$(say "FEHLER: ssh-keyscan für ${plain_host} fehlgeschlagen. Hostkey konnte nicht abgerufen werden." \
+            "ERROR: ssh-keyscan for ${plain_host} failed. Could not retrieve host key.")${NC}"
+        return 1
+    fi
+    
+    echo "$keyscan_out" >> "$SSH_KNOWN_HOSTS"
+    echo -e "${G}$(say "✓ Hostkey für ${host_for_kh} eingetragen." "✓ Host key for ${host_for_kh} added.")${NC}"
+    return 0
 }
 
-# -------------------- NEW: Panzerbackup Auto-Detection --------------------
+# -------------------- Panzerbackup Auto-Detection --------------------
 detect_newest_panzerbackup() {
     local media_base="/media/$USER"
     [[ -d "$media_base" ]] || return 1
     
-    local candidates=()
     local dirs=()
     
-    # Find all directories with "panzerbackup" in name (case-insensitive)
     while IFS= read -r -d '' dir; do
         dirs+=( "$dir" )
     done < <(find "$media_base" -maxdepth 2 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
     
     [[ ${#dirs[@]} -eq 0 ]] && return 1
     
-    # Find newest backup file in each directory
-    local newest_file=""
     local newest_time=0
     local newest_dir=""
     
@@ -555,7 +560,6 @@ detect_newest_panzerbackup() {
             mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
             if (( mtime > newest_time )); then
                 newest_time=$mtime
-                newest_file="$f"
                 newest_dir="$dir"
             fi
         done
@@ -565,12 +569,11 @@ detect_newest_panzerbackup() {
     return 1
 }
 
-# -------------------- NEW: Extract hostname from Panzerbackup files --------------------
+# -------------------- Extract hostname from Panzerbackup files --------------------
 extract_hostname_from_panzerbackup() {
     local dir="$1"
     [[ ! -d "$dir" ]] && return 1
     
-    # Find newest panzer backup file
     local newest_file=""
     local newest_time=0
     
@@ -588,36 +591,27 @@ extract_hostname_from_panzerbackup() {
     local basename
     basename="$(basename "$newest_file")"
     
-    # Extract hostname from pattern: panzer_HOSTNAME-panzerbackup-DATE_...
-    # or: panzer_HOSTNAME_DATE_...
     if [[ "$basename" =~ ^panzer_(.+)-panzerbackup ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
+        echo "${BASH_REMATCH[1]}"; return 0
     elif [[ "$basename" =~ ^panzer_(.+)_panzerbackup ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
+        echo "${BASH_REMATCH[1]}"; return 0
     elif [[ "$basename" =~ ^panzer_([^_]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
+        echo "${BASH_REMATCH[1]}"; return 0
     fi
     
-    # Fallback: use system hostname
     hostname 2>/dev/null || echo "unknown"
     return 0
 }
 
-# -------------------- NEW: Backup type detection --------------------
+# -------------------- Backup type detection --------------------
 is_panzerbackup_source() {
     local dir="$1"
-    # Check if directory path contains "panzerbackup" (case-insensitive)
     [[ "$dir" =~ [Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp] ]] && return 0
-    # Check if directory contains panzer_*.img files
     find "$dir" -maxdepth 1 -type f \( -name "panzer_*.img.zst.gpg" -o -name "panzer_*.img.zst" \) ! -name "*.part" -print0 2>/dev/null | grep -qz . && return 0
     return 1
 }
 
 detect_src_dir() {
-    # First try auto-detection of mounted Panzerbackup
     local detected_dir
     detected_dir="$(detect_newest_panzerbackup 2>/dev/null || true)"
     
@@ -628,7 +622,6 @@ detect_src_dir() {
         return 0
     fi
     
-    # Fallback to configured SRC_DIR
     if [[ -n "$SRC_DIR" ]]; then
         SRC_DIR="$(expand_path "$SRC_DIR")"
         [[ -d "$SRC_DIR" ]] || { 
@@ -638,7 +631,6 @@ detect_src_dir() {
         return 0
     fi
     
-    # Try fallback directories
     local possible=("$HOME/panzerbackup" "/home/$USER/panzerbackup")
     for d in "${possible[@]}"; do
         if [[ -d "$d" ]]; then SRC_DIR="$d"; return 0; fi
@@ -690,7 +682,11 @@ test_ssh_auth() {
     echo "$out" >> "$LOG_FILE" 2>/dev/null || true
     
     if echo "$out" | grep -qiE 'host key verification failed|remote host identification has changed'; then
-        set_conn_status "$(say 'FEHLER: SSH Hostkey Problem.' 'ERROR: SSH hostkey problem.')"; return 1
+        set_conn_status "$(say 'FEHLER: SSH Hostkey Problem. Bitte known_hosts prüfen.' 'ERROR: SSH hostkey problem. Please check known_hosts.')"
+        echo -e "${R}$(say 'FEHLER: SSH Hostkey-Verifikation fehlgeschlagen!' 'ERROR: SSH host key verification failed!')${NC}"
+        echo -e "${Y}$(say "  → Tipp: Führe manuell aus: ssh-keyscan -t ed25519 ${host} >> ${SSH_KNOWN_HOSTS}" \
+            "  → Hint: Run manually: ssh-keyscan -t ed25519 ${host} >> ${SSH_KNOWN_HOSTS}")${NC}"
+        return 1
     fi
     if echo "$out" | grep -qiE 'permission denied|no supported authentication methods'; then
         set_conn_status "$(say 'FEHLER: SSH Auth fehlgeschlagen.' 'ERROR: SSH auth failed.')"; return 1
@@ -749,26 +745,21 @@ test_connection() {
     fi
 }
 
-# -------------------- NEW: Smart Prune Logic --------------------
+# -------------------- Smart Prune Logic --------------------
 get_archive_prefix_for_source() {
     local src_dir="$1"
     local is_panzer=0
     
-    # Check if this is a Panzerbackup source
     is_panzerbackup_source "$src_dir" && is_panzer=1
     
     if (( is_panzer )); then
-        # Extract hostname
         local hostname_extracted
         hostname_extracted="$(extract_hostname_from_panzerbackup "$src_dir" 2>/dev/null || true)"
         [[ -z "$hostname_extracted" ]] && hostname_extracted="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "unknown")"
         hostname_extracted="$(sanitize_for_archive_component "$hostname_extracted")"
-        
-        # Prefix is always panzerbackup-HOSTNAME (matching how archives are created)
         echo "panzerbackup-${hostname_extracted}"
         return 0
     else
-        # Data backup: use hostname
         local hostname_clean
         hostname_clean="$(hostname 2>/dev/null || echo "unknown")"
         echo "$hostname_clean"
@@ -776,9 +767,7 @@ get_archive_prefix_for_source() {
     fi
 }
 
-# -------------------- NEW: Interactive manual archive selection with IMMEDIATE deletion --------------------
-# Returns: 0 = archives deleted OR user skipped (continue upload)
-#          1 = user explicitly cancelled (abort upload)
+# -------------------- Interactive manual archive selection with IMMEDIATE deletion --------------------
 interactive_archive_selection() {
     echo ""
     echo -e "${C}$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')${NC}"
@@ -786,7 +775,6 @@ interactive_archive_selection() {
     echo -e "${C}$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')${NC}"
     echo ""
     
-    # Get all archives
     local list_cmd
     list_cmd="$(borg_list_cmd)"
     local all_archives=()
@@ -815,19 +803,16 @@ interactive_archive_selection() {
     local selection
     read -r -p "$(say 'Archive zum Löschen: ' 'Archives to delete: ')" selection
     
-    # Empty selection = skip deletion, but continue upload
     if [[ -z "$selection" ]]; then
         echo "$(say 'Keine Archive zum Löschen ausgewählt. Upload wird fortgesetzt.' 'No archives selected for deletion. Upload will continue.')"
         return 0
     fi
     
-    # Parse selection
     local to_delete=()
     local ranges=($selection)
     
     for range in "${ranges[@]}"; do
         if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            # Range: 1-3
             local start="${BASH_REMATCH[1]}"
             local end="${BASH_REMATCH[2]}"
             for ((n=start; n<=end; n++)); do
@@ -836,7 +821,6 @@ interactive_archive_selection() {
                 fi
             done
         elif [[ "$range" =~ ^[0-9]+$ ]]; then
-            # Single number
             local n="$range"
             if (( n >= 1 && n <= ${#all_archives[@]} )); then
                 to_delete+=( "${all_archives[$((n-1))]}" )
@@ -844,7 +828,6 @@ interactive_archive_selection() {
         fi
     done
     
-    # Remove duplicates
     mapfile -t to_delete < <(printf "%s\n" "${to_delete[@]}" | sort -u)
     
     if (( ${#to_delete[@]} == 0 )); then
@@ -852,7 +835,6 @@ interactive_archive_selection() {
         return 0
     fi
     
-    # Show what will be deleted
     echo ""
     echo -e "${R}$(say 'Diese Archive werden GELÖSCHT:' 'These archives will be DELETED:')${NC}"
     for archive in "${to_delete[@]}"; do
@@ -867,10 +849,9 @@ interactive_archive_selection() {
     
     if [[ "$confirm" != "JA" && "$confirm" != "YES" ]]; then
         echo "$(say 'Löschvorgang abgebrochen.' 'Deletion cancelled.')"
-        return 1  # User explicitly cancelled
+        return 1
     fi
     
-    # DELETE IMMEDIATELY
     echo ""
     echo "$(say '┌─ Lösche ausgewählte Archive... ───────────────────────┐' '┌─ Deleting selected archives... ────────────────────────┐')"
     echo ""
@@ -901,8 +882,6 @@ interactive_archive_selection() {
     fi
     
     echo ""
-    
-    # Run compact to free space immediately
     echo "$(say 'Gebe Speicherplatz frei (Compact)...' 'Freeing up space (Compact)...')"
     if borg compact "$REPO" 2>&1 | tee -a "$LOG_FILE"; then
         echo -e "${G}$(say '✓ Compact erfolgreich' '✓ Compact successful')${NC}"
@@ -911,12 +890,9 @@ interactive_archive_selection() {
     fi
     
     echo ""
-    return 0  # Continue with upload
+    return 0
 }
 
-# Returns: 0 = continue upload (no prune needed or manual deletion done)
-#          1 = abort upload (user cancelled)
-#          2 = automatic prune needed (needs confirmation)
 show_prune_preview() {
     local src_dir="$1"
     local is_panzer=0
@@ -929,17 +905,14 @@ show_prune_preview() {
     echo "$(say '└─────────────────────────────────────────────────────────┘' '└─────────────────────────────────────────────────────────┘')"
     echo ""
     
-    # Get archive prefix for this source
     local archive_prefix
     archive_prefix="$(get_archive_prefix_for_source "$src_dir")" || return 1
     
-    # Get list of all archives
     local list_cmd
     list_cmd="$(borg_list_cmd)"
     local all_archives=()
     mapfile -t all_archives < <(borg_with_ssh "$list_cmd" --short "$REPO" 2>/dev/null | sort -r)
     
-    # Filter archives matching this prefix
     local matching_archives=()
     for archive in "${all_archives[@]}"; do
         if [[ "$archive" == "$archive_prefix"* ]]; then
@@ -969,10 +942,10 @@ show_prune_preview() {
         
         if [[ "$manual_select" =~ ^[jJyY] ]]; then
             interactive_archive_selection
-            return $?  # Return whatever interactive_archive_selection returns
+            return $?
         else
             echo "$(say 'Keine Archive werden gelöscht. Upload wird fortgesetzt.' 'No archives will be deleted. Upload will continue.')"
-            return 0  # Continue upload without deletion
+            return 0
         fi
     fi
     
@@ -984,7 +957,7 @@ show_prune_preview() {
             echo -e "  ${G}✓ $archive${NC}"
         done
         echo ""
-        return 0  # No prune needed, continue upload
+        return 0
     fi
     
     local to_delete=$((total - keep))
@@ -1006,7 +979,7 @@ show_prune_preview() {
     echo -e "${Y}$(say 'ACHTUNG: Diese Aktion kann nicht rückgängig gemacht werden!' 'CAUTION: This action cannot be undone!')${NC}"
     echo ""
     
-    return 2  # Automatic prune needed, requires confirmation
+    return 2
 }
 
 # -------------------- Upload/Download logic --------------------
@@ -1017,7 +990,6 @@ show_upload_selection() {
     echo "$(say '═══════════════════════════════════════════════════════════' '═══════════════════════════════════════════════════════════')"
     echo ""
     
-    # Auto-detect source directory
     if ! detect_src_dir; then
         return 1
     fi
@@ -1026,7 +998,6 @@ show_upload_selection() {
     echo "$(say "Quellverzeichnis: $SRC_DIR" "Source directory: $SRC_DIR")"
     echo "$(say "Ziel-Repo: $REPO" "Target repo: $REPO")"
     
-    # Detect backup type
     local is_panzer=0
     is_panzerbackup_source "$SRC_DIR" && is_panzer=1
     
@@ -1049,7 +1020,6 @@ show_upload_selection() {
     echo "$(say "Größe: $(human_bytes "$size")" "Size: $(human_bytes "$size")")"
     echo ""
     
-    # Ask for confirmation
     read -r -p "$(say 'Dieses Verzeichnis für Upload verwenden? (j/n): ' 'Use this directory for upload? (y/n): ')" confirm
     if [[ ! "$confirm" =~ ^[jJyY] ]]; then
         echo "$(say 'Upload abgebrochen.' 'Upload cancelled.')"
@@ -1060,8 +1030,6 @@ show_upload_selection() {
 }
 
 do_upload_background() {
-    # Wrapper for interactive mode: always start a detached worker so CTRL+C closes the UI
-    # without killing the actual upload.
     if is_running; then
         echo -e "${Y}$(say '⚠ Es läuft bereits ein Job.' '⚠ A job is already running.')${NC}"
         return 1
@@ -1069,7 +1037,6 @@ do_upload_background() {
 
     ensure_logfile_writable
 
-    # Ensure we have a valid source (Panzerbackup auto-detect etc.)
     if ! detect_src_dir >/dev/null 2>&1; then
         echo -e "${R}$(say '✗ Kein gültiges Backup-Verzeichnis gefunden.' '✗ No valid backup directory found.')${NC}"
         return 1
@@ -1086,8 +1053,6 @@ start_detached_worker() {
 
     ensure_logfile_writable
 
-    # Start worker in its own session so terminal CTRL+C / closing the terminal does NOT kill it.
-    # We redirect stdin to avoid reads and stdout/stderr to /dev/null (worker logs to LOG_FILE itself).
     nohup setsid "$0" --worker "$mode" "$@" </dev/null >/dev/null 2>&1 &
     local pid=$!
 
@@ -1104,7 +1069,6 @@ worker_upload() {
     echo "$$" > "$PID_FILE"
     date +%s > "$START_FILE" 2>/dev/null || true
 
-    # Cleanup PID/START on exit, even on errors
     cleanup_worker_files() {
         rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
     }
@@ -1127,7 +1091,6 @@ worker_upload() {
         return 1
     fi
 
-    # Ensure src exists (auto-detect Panzerbackup if needed)
     if [[ -z "$src_dir" || ! -d "$src_dir" ]]; then
         if detect_src_dir >/dev/null 2>&1; then
             src_dir="$SRC_DIR"
@@ -1155,7 +1118,6 @@ worker_upload() {
         prune_pattern="${archive_prefix}-*"
     fi
 
-    # Optional prune/compact BEFORE create
     if [[ "${PRUNE:-yes}" == "yes" ]] && { [[ "${PRUNE_BEFORE_CREATE:-yes}" == "yes" ]] || [[ -f "$PRUNE_NEEDED_FLAG" ]]; }; then
         rm -f "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
         set_job_status "$(say 'UPLOAD: Smart-Prune (vorher)...' 'UPLOAD: Smart prune (pre)...')"
@@ -1189,7 +1151,6 @@ worker_upload() {
     local rc=0
 
     if [[ "$is_panzer" == "yes" ]]; then
-        # Upload only latest Panzerbackup set
         local latest_img base img sha sfd
         latest_img="$(ls -1t "${src_dir}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
         if [[ -z "$latest_img" ]]; then
@@ -1233,7 +1194,6 @@ worker_upload() {
         rm -f "$include_file" "$create_out" 2>/dev/null || true
 
     else
-        # Generic: upload the whole directory
         local create_out
         create_out="$(mktemp)"
 
@@ -1257,7 +1217,6 @@ worker_upload() {
         echo "" | tee -a "$LOG_FILE"
         set_job_status "$(say '✓ UPLOAD: Abgeschlossen' '✓ UPLOAD: Finished')"
 
-        # Optional prune/compact AFTER create
         if [[ "${PRUNE_AFTER_CREATE:-yes}" == "yes" && "${PRUNE:-yes}" == "yes" ]]; then
             set_job_status "$(say 'UPLOAD: Smart-Prune (nachher)...' 'UPLOAD: Smart prune (post)...')"
             borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
@@ -1432,13 +1391,11 @@ run_wizard() {
     echo "$(say 'Beispiele:' 'Examples:')"
     echo "  - panzerbackup-{hostname}-{date}"
     echo "  - {hostname}-panzerbackup-{date}"
-    echo "  - Panzerbackup-Server-{hostname}-{date}"
     
     while true; do
         read -r -p "Template [${PANZERBACKUP_ARCHIVE_NAME}]: " new_archive_template
         [[ -z "$new_archive_template" ]] && new_archive_template="${PANZERBACKUP_ARCHIVE_NAME}"
         
-        # Validate template contains "panzerbackup"
         if [[ "$new_archive_template" =~ [Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp] ]]; then
             PANZERBACKUP_ARCHIVE_NAME="$new_archive_template"
             echo -e "${G}$(say '✓ Template akzeptiert' '✓ Template accepted')${NC}"
@@ -1470,32 +1427,38 @@ run_wizard() {
     
     echo ""
     echo "$(say '─── Repository Passphrase ───' '─── Repository Passphrase ───')"
-    echo "$(say 'Passphrase für das Borg-Repository (wird lokal verschlüsselt gespeichert)' 'Passphrase for Borg repository (stored locally encrypted)')"
-    read -r -s -p "Repo Passphrase: " pass
+    # FIXED: Honest description - plaintext file, protected by file permissions only
+    echo -e "${Y}$(say 'HINWEIS: Die Passphrase wird als Klartext in einer Datei gespeichert,' \
+        'NOTE: The passphrase is stored as plaintext in a file,')${NC}"
+    echo -e "${Y}$(say '         die nur für diesen Benutzer lesbar ist (chmod 600).' \
+        '         readable only by this user (chmod 600).')${NC}"
+    echo -e "${Y}$(say '         Das Borg-Repository selbst ist verschlüsselt.' \
+        '         The Borg repository itself is encrypted.')${NC}"
+    read -r -s -p "$(say 'Repo Passphrase: ' 'Repo Passphrase: ')" pass
     echo ""
     if [[ -n "$pass" ]]; then
         echo -n "$pass" > "$PASSPHRASE_FILE"
         chmod 600 "$PASSPHRASE_FILE"
-        echo "$(say '✓ Repository-Passphrase gespeichert.' '✓ Repository passphrase saved.')"
+        echo -e "${G}$(say '✓ Repository-Passphrase gespeichert (chmod 600).' '✓ Repository passphrase saved (chmod 600).')${NC}"
     fi
     
     echo ""
     echo "$(say '─── SSH-Key Passphrase (optional) ───' '─── SSH Key Passphrase (optional) ───')"
-    # Check if selected key needs passphrase
     if [[ -f "$SSH_KEY" ]] && ! ssh-keygen -y -P "" -f "$SSH_KEY" >/dev/null 2>&1; then
         echo -e "${Y}$(say '⚠ Der gewählte SSH-Key ist verschlüsselt und benötigt eine Passphrase.' '⚠ The selected SSH key is encrypted and requires a passphrase.')${NC}"
     else
         echo "$(say 'Falls Ihr SSH-Key eine Passphrase hat, geben Sie diese hier ein.' 'If your SSH key has a passphrase, enter it here.')"
     fi
+    echo -e "${Y}$(say 'HINWEIS: Auch diese wird als Klartext (chmod 600) gespeichert.' \
+        'NOTE: This is also stored as plaintext (chmod 600).')${NC}"
     echo "$(say 'Leer lassen, wenn der Key keine Passphrase hat.' 'Leave empty if key has no passphrase.')"
     read -r -s -p "SSH Key Passphrase (optional): " sshpass
     echo ""
     if [[ -n "$sshpass" ]]; then
         echo -n "$sshpass" > "$SSH_KEY_PASSPHRASE_FILE"
         chmod 600 "$SSH_KEY_PASSPHRASE_FILE"
-        echo "$(say '✓ SSH-Key-Passphrase gespeichert.' '✓ SSH key passphrase saved.')"
+        echo -e "${G}$(say '✓ SSH-Key-Passphrase gespeichert (chmod 600).' '✓ SSH key passphrase saved (chmod 600).')${NC}"
     else
-        # Remove old passphrase file if user left it empty
         rm -f "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || true
         echo "$(say 'Keine SSH-Key-Passphrase gespeichert.' 'No SSH key passphrase saved.')"
     fi
@@ -1506,7 +1469,6 @@ run_wizard() {
     read -r -p "de/en [${UI_LANG:-de}]: " lang_choice
     [[ -n "$lang_choice" ]] && UI_LANG="$lang_choice"
     
-    # Save to env file
     cat <<EOF > "$ENV_FILE"
 REPO="${REPO}"
 SRC_DIR="${SRC_DIR}"
@@ -1515,13 +1477,13 @@ KEEP_LAST="${KEEP_LAST}"
 KEEP_LAST_PANZERBACKUP="${KEEP_LAST_PANZERBACKUP}"
 PANZERBACKUP_ARCHIVE_NAME="${PANZERBACKUP_ARCHIVE_NAME}"
 UI_LANG="${UI_LANG}"
+AUTO_ACCEPT_HOSTKEY="yes"
 EOF
     
     echo ""
     echo "$(say '✓ Konfiguration gespeichert in: '"$ENV_FILE" '✓ Configuration saved to: '"$ENV_FILE")"
     echo ""
     
-    # Test connection immediately
     echo "$(say 'Teste Verbindung...' 'Testing connection...')"
     if test_connection; then
         echo -e "${G}$(say '✓ Setup erfolgreich!' '✓ Setup successful!')${NC}"
@@ -1533,18 +1495,9 @@ EOF
 
 # -------------------- Sleep inhibition (systemd-inhibit) --------------------
 maybe_inhibit_exec() {
-    # Re-exec this script under systemd-inhibit for long-running CLI runs.
-    # (In interactive mode we only inhibit inside the worker.)
-    if [[ "${INHIBIT_SLEEP:-yes}" != "yes" ]]; then
-        return 0
-    fi
-    if [[ -n "${_INHIBITED:-}" ]]; then
-        return 0
-    fi
-    if ! command -v systemd-inhibit >/dev/null 2>&1; then
-        return 0
-    fi
-
+    if [[ "${INHIBIT_SLEEP:-yes}" != "yes" ]]; then return 0; fi
+    if [[ -n "${_INHIBITED:-}" ]]; then return 0; fi
+    if ! command -v systemd-inhibit >/dev/null 2>&1; then return 0; fi
     export _INHIBITED=1
     exec systemd-inhibit --what="${INHIBIT_WHAT}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY}" "$0" "$@"
 }
@@ -1552,17 +1505,9 @@ maybe_inhibit_exec() {
 maybe_inhibit_reexec_worker() {
     local mode="${1:-worker}"
     shift || true
-
-    if [[ "${INHIBIT_SLEEP:-yes}" != "yes" ]]; then
-        return 0
-    fi
-    if [[ -n "${_INHIBITED:-}" ]]; then
-        return 0
-    fi
-    if ! command -v systemd-inhibit >/dev/null 2>&1; then
-        return 0
-    fi
-
+    if [[ "${INHIBIT_SLEEP:-yes}" != "yes" ]]; then return 0; fi
+    if [[ -n "${_INHIBITED:-}" ]]; then return 0; fi
+    if ! command -v systemd-inhibit >/dev/null 2>&1; then return 0; fi
     export _INHIBITED=1
     exec systemd-inhibit --what="${INHIBIT_WHAT}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} (${mode})" "$0" --worker "$mode" "$@"
 }
@@ -1585,7 +1530,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-${CONFIG_FILE}
+EnvironmentFile=-${CONFIG_DIR}/borgbase-manager.env
 Environment=INHIBIT_SLEEP=yes
 ExecStart=${script_path} upload
 EOF
@@ -1638,7 +1583,7 @@ break_lock_repo() {
     borg break-lock "$REPO" 2>&1 | tee -a "$LOG_FILE"
 }
 
-# -------------------- Live progress (safe, returns to menu) --------------------
+# -------------------- Live progress --------------------
 live_progress_view() {
     ensure_logfile_writable
 
@@ -1669,15 +1614,10 @@ live_progress_view() {
             echo "$(say 'Noch kein Log vorhanden.' 'No log yet.')"
         fi
 
-        if [[ "$key" == "q" ]]; then
-            break
-        fi
+        if [[ "$key" == "q" ]]; then break; fi
         read -r -n 1 -t 2 key || true
-        if [[ "$key" == "q" ]]; then
-            break
-        fi
+        if [[ "$key" == "q" ]]; then break; fi
 
-        # If worker ended, exit automatically after a short note
         if ! is_running; then
             echo ""
             echo -e "${Y}$(say 'Kein laufender Job mehr erkannt.' 'No running job detected anymore.')${NC}"
@@ -1689,12 +1629,18 @@ live_progress_view() {
 
     trap - INT
 }
+
 # -------------------- Menu --------------------
 show_menu() {
     clear 2>/dev/null || true
     echo -e "${B}${BOLD}============================================================${NC}"
     echo -e "${B}${BOLD}  BorgBase Backup Manager (Smart-Prune)${NC}"
     echo -e "${B}${BOLD}============================================================${NC}"
+    echo ""
+    local job_line; job_line="$(get_job_status_formatted)"
+    local conn_line; conn_line="$(get_conn_status_formatted)"
+    echo -e "  $(say 'Job:  ' 'Job:  ') ${job_line}"
+    echo -e "  $(say 'Repo: ' 'Repo: ') ${conn_line}"
     echo ""
     echo -e "${C}1)  $(say 'Backup zu BorgBase hochladen' 'Upload backup to BorgBase')${NC}"
     echo -e "${C}2)  $(say 'Backup von BorgBase herunterladen' 'Download backup from BorgBase')${NC}"
@@ -1715,13 +1661,11 @@ show_menu() {
 load_env
 
 # -------------------- CLI / Worker entrypoints --------------------
-# Worker mode is used for detached background jobs and systemd service runs.
 if [[ "${1:-}" == "--worker" ]]; then
     shift || true
     worker_mode="${1:-}"
     shift || true
 
-    # Re-exec under systemd-inhibit (prevents sleep) once.
     maybe_inhibit_reexec_worker "$worker_mode" "$@"
 
     worker_src_dir=""
@@ -1760,9 +1704,8 @@ if [[ "${1:-}" == "--worker" ]]; then
     esac
 fi
 
-# Non-interactive CLI mode (foreground). Useful for systemd: ExecStart=... upload
+# Non-interactive CLI mode
 if [[ $# -gt 0 ]]; then
-    # Prevent sleep for long-running runs
     maybe_inhibit_exec "$@"
 
     [[ -z "${UI_LANG:-}" ]] && UI_LANG="de"
@@ -1831,16 +1774,13 @@ while true; do
                 echo -e "${R}$(say 'Ein Job läuft bereits!' 'A job is already running!')${NC}"
                 pause
             else
-                # Show upload selection and source detection
                 if ! show_upload_selection; then
                     pause
                     continue
                 fi
                 
-                # Clean up any leftover flags
                 rm -f "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
                 
-                # Show prune preview if enabled
                 if [[ "${PRUNE:-yes}" == "yes" ]]; then
                     if ! test_connection; then
                         pause
@@ -1850,27 +1790,19 @@ while true; do
                     show_prune_preview "$SRC_DIR"
                     prune_rc=$?
                     
-                    # Handle return codes:
-                    # 0 = continue (no prune needed, or manual deletion done, or user skipped)
-                    # 1 = abort (user explicitly cancelled)
-                    # 2 = automatic prune needed (ask for confirmation)
-                    
                     if (( prune_rc == 1 )); then
                         echo "$(say 'Upload abgebrochen.' 'Upload cancelled.')"
                         pause
                         continue
                     elif (( prune_rc == 2 )); then
-                        # Automatic prune - ask for strong confirmation (JA/YES)
                         read -r -p "$(say 'Alte Backups wie gezeigt löschen? (JA zum Bestätigen): ' 'Delete old backups as shown? (type YES to confirm): ')" prune_confirm
                         if [[ "$prune_confirm" != "JA" && "$prune_confirm" != "YES" ]]; then
                             echo "$(say 'Löschvorgang abgebrochen. Upload wird nicht gestartet.' 'Deletion cancelled. Upload will not start.')"
                             pause
                             continue
                         fi
-                        # Set flag so background job knows to run prune
                         touch "$PRUNE_NEEDED_FLAG"
                     fi
-                    # If prune_rc == 0, just continue (manual deletion already done or skipped)
                 fi
                 
                 echo ""
@@ -1880,7 +1812,6 @@ while true; do
                     echo "$(say 'Job im Hintergrund gestartet.' 'Job started in background.')"
                     sleep 1
                 else
-                    # Clean up flag if user cancelled
                     rm -f "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
                 fi
             fi
@@ -1925,6 +1856,7 @@ while true; do
             echo "$(say 'Repository:' 'Repository:') $REPO"
             echo "$(say 'Quellverzeichnis:' 'Source Directory:') $SRC_DIR"
             echo "$(say 'SSH-Key:' 'SSH Key:') $SSH_KEY"
+            echo "$(say 'Auto-Accept Hostkey:' 'Auto-Accept Hostkey:') ${AUTO_ACCEPT_HOSTKEY}"
             echo ""
             echo "$(say '─── Aufbewahrungsrichtlinien ───' '─── Retention Policies ───')"
             echo "$(say 'Datenbackups behalten:' 'Keep data backups:') $KEEP_LAST $(say 'Stück' 'archives')"
@@ -1935,12 +1867,16 @@ while true; do
             echo ""
             echo "$(say 'Passphrasen-Status:' 'Passphrase Status:')"
             if [[ -f "$PASSPHRASE_FILE" ]]; then
-                echo "  $(say '✓ Repository-Passphrase: gespeichert' '✓ Repository passphrase: saved')"
+                local perm
+                perm="$(stat -c '%a' "$PASSPHRASE_FILE" 2>/dev/null || echo '???')"
+                echo -e "  ${G}$(say '✓ Repository-Passphrase: gespeichert' '✓ Repository passphrase: saved')${NC} $(say "(Klartext, chmod ${perm})" "(plaintext, chmod ${perm})")"
             else
-                echo "  $(say '✗ Repository-Passphrase: FEHLT' '✗ Repository passphrase: MISSING')"
+                echo -e "  ${R}$(say '✗ Repository-Passphrase: FEHLT' '✗ Repository passphrase: MISSING')${NC}"
             fi
             if [[ -f "$SSH_KEY_PASSPHRASE_FILE" ]]; then
-                echo "  $(say '✓ SSH-Key-Passphrase: gespeichert' '✓ SSH key passphrase: saved')"
+                local perm2
+                perm2="$(stat -c '%a' "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || echo '???')"
+                echo -e "  ${G}$(say '✓ SSH-Key-Passphrase: gespeichert' '✓ SSH key passphrase: saved')${NC} $(say "(Klartext, chmod ${perm2})" "(plaintext, chmod ${perm2})")"
             else
                 echo "  $(say '○ SSH-Key-Passphrase: nicht gesetzt' '○ SSH key passphrase: not set')"
             fi
@@ -1948,6 +1884,7 @@ while true; do
             echo "$(say 'Dateien:' 'Files:')"
             echo "  Config: $ENV_FILE"
             echo "  Log: $LOG_FILE"
+            echo "  Known Hosts: $SSH_KNOWN_HOSTS"
             echo ""
             pause
             ;;
