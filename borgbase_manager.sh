@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.6
+# BorgBase Backup Manager v1.8.8
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -7,6 +7,7 @@
 # - SMART PRUNE: Different retention policies for Panzerbackup vs. Data backups
 # - INTERACTIVE CLEANUP: Manual selection with immediate deletion
 # - AUTO-DETECT: Automatically finds newest mounted Panzerbackup
+# - FIXED: Detects mounted Panzerbackup under /media/* and /run/media/*, not only /media/$USER
 # - INTERACTIVE PRUNE: Shows archives before deletion for safety
 # - UI: Always handles DE/EN selection, better progress output.
 # - ROBUSTNESS: Better error handling and connection testing.
@@ -39,7 +40,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.7"
+APP_VERSION="v1.8.8"
 
 STATUS_FIELD_WIDTH=49
 
@@ -538,21 +539,29 @@ ensure_known_hosts() {
 
 # -------------------- Panzerbackup Auto-Detection --------------------
 detect_newest_panzerbackup() {
-    local media_base="/media/$USER"
-    [[ -d "$media_base" ]] || return 1
+    local search_bases=()
+    [[ -d "/media" ]] && search_bases+=( "/media" )
+    [[ -d "/run/media" ]] && search_bases+=( "/run/media" )
+    [[ ${#search_bases[@]} -eq 0 ]] && return 1
     
     local dirs=()
-    
-    while IFS= read -r -d '' dir; do
-        dirs+=( "$dir" )
-    done < <(find "$media_base" -maxdepth 2 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
+    local base dir
+    for base in "${search_bases[@]}"; do
+        while IFS= read -r -d '' dir; do
+            dirs+=( "$dir" )
+        done < <(find "$base" -mindepth 1 -maxdepth 3 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
+    done
     
     [[ ${#dirs[@]} -eq 0 ]] && return 1
+    
+    local unique_dirs=()
+    mapfile -t unique_dirs < <(printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++')
+    [[ ${#unique_dirs[@]} -eq 0 ]] && return 1
     
     local newest_time=0
     local newest_dir=""
     
-    for dir in "${dirs[@]}"; do
+    for dir in "${unique_dirs[@]}"; do
         local files=()
         while IFS= read -r -d '' f; do
             files+=( "$f" )
@@ -642,7 +651,7 @@ detect_src_dir() {
     echo -e "${R}$(say 'FEHLER: Kein Panzerbackup-Verzeichnis gefunden!' 'ERROR: No Panzerbackup directory found!')${NC}"
     echo ""
     echo "$(say 'Bitte stellen Sie sicher, dass:' 'Please ensure that:')"
-    echo "  $(say '1) Ein USB-Stick mit Panzerbackup gemountet ist (unter /media/'"$USER"')' '1) A USB stick with Panzerbackup is mounted (under /media/'"$USER"')')"
+    echo "  $(say '1) Ein USB-Stick mit Panzerbackup gemountet ist (z. B. unter /media/<Benutzer>/... oder /run/media/<Benutzer>/...)' '1) A USB stick with Panzerbackup is mounted (for example under /media/<user>/... or /run/media/<user>/...)')"
     echo "  $(say '2) Oder konfigurieren Sie SRC_DIR manuell' '2) Or configure SRC_DIR manually')"
     echo ""
     return 1
