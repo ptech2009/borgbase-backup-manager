@@ -39,7 +39,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.6"
+APP_VERSION="v1.8.7"
 
 STATUS_FIELD_WIDTH=49
 
@@ -1805,6 +1805,17 @@ while true; do
                 fi
                 
                 echo ""
+
+                if is_panzerbackup_source "$SRC_DIR"; then
+                    latest_img_preview="$(ls -1t "${SRC_DIR}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
+                    if [[ -n "$latest_img_preview" ]]; then
+                        echo -e "${C}$(say 'Lokale Datei für Upload:' 'Local file for upload:')${NC} $(basename "$latest_img_preview")"
+                    else
+                        echo -e "${Y}$(say '⚠ Keine panzer_*.img.zst.gpg im Quellverzeichnis gefunden' '⚠ No panzer_*.img.zst.gpg found in source directory')${NC}"
+                    fi
+                    echo ""
+                fi
+
                 read -r -p "$(say 'Jetzt Upload starten? (j/n): ' 'Start upload now? (y/n): ')" yn
                 if [[ "$yn" =~ ^[jJyY] ]]; then
                     do_upload_background
