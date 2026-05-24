@@ -2,6 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
+[![Version](https://img.shields.io/badge/version-1.8.10-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -273,6 +274,10 @@ Enable detailed logging:
 ```bash
 DEBUG=1 ./borgbase_manager.sh
 ```
+
+## 📝 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## 🙏 Acknowledgments
 
