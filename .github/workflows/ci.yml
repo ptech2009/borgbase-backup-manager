@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax check
+        run: |
+          find . -type f -name "*.sh" -print0 | xargs -0 -r bash -n
+
+      - name: ShellCheck
+        run: |
+          find . -type f -name "*.sh" -print0 | xargs -0 -r shellcheck
+
+      - name: Git diff check
+        run: git diff --check
