@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.10-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.12-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -36,6 +36,7 @@ A secure, production-ready backup management tool for uploading and downloading 
 - **🔄 Automated Workflows**: systemd-friendly for scheduled backups
 - **💤 Sleep Inhibit**: Prevents system sleep/idle during backup operations (systemd-inhibit)
 - **🔄 Checkpoint Support**: Borg checkpointing for interruption resilience
+- **📡 Long Upload Resilience**: SSH keepalive defaults and clear broken-pipe diagnostics for multi-hundred-GB/TB transfers
 
 ## 📋 Prerequisites
 
@@ -190,6 +191,10 @@ BORG_CHECKPOINT_INTERVAL=300     # Checkpoint interval in seconds
 
 # Connection settings
 SSH_CONNECT_TIMEOUT=10           # SSH connection timeout
+SSH_SERVER_ALIVE_INTERVAL=60     # Keep SSH sessions alive during long uploads
+SSH_SERVER_ALIVE_COUNT_MAX=30    # Allow up to 30 missed keepalive replies
+SSH_TCP_KEEPALIVE=yes            # Enable TCP keepalives
+SSH_IPQOS=none                   # Avoid problematic QoS handling on some networks
 BORG_LOCK_WAIT=60               # Wait time for repo locks
 AUTO_ACCEPT_HOSTKEY=no          # Auto-add SSH host key
 AUTO_TEST_SSH=yes               # Test SSH on startup
@@ -197,7 +202,8 @@ AUTO_TEST_REPO=yes              # Test repo access on startup
 
 # Sleep prevention
 INHIBIT_SLEEP=yes               # Prevent sleep during operations
-INHIBIT_WHAT=sleep:idle         # What to inhibit
+INHIBIT_WHAT=sleep:idle:handle-lid-switch  # What to inhibit
+INHIBIT_FALLBACK_WHAT=sleep:idle           # Fallback for older systemd versions
 INHIBIT_MODE=block              # Inhibit mode
 ```
 
@@ -210,16 +216,16 @@ Install user-level systemd units for automatic scheduled backups:
 ./borgbase_manager.sh install-service
 
 # Enable and start timer
-systemctl --user enable --now borgbase-upload.timer
+systemctl --user enable --now borgbase-backup-manager.timer
 
 # Check status
-systemctl --user status borgbase-upload.timer
+systemctl --user status borgbase-backup-manager.timer
 systemctl --user list-timers
 ```
 
 **Installed Units:**
-- `borgbase-upload.service` - One-shot upload service
-- `borgbase-upload.timer` - Daily upload timer
+- `borgbase-backup-manager.service` - One-shot upload service
+- `borgbase-backup-manager.timer` - Daily upload timer
 
 ## 🛡️ Security Features
 
@@ -263,6 +269,11 @@ If you see "Repository locked" warnings:
 2. Verify SSH key is added to BorgBase
 3. Check `~/.ssh/known_hosts` contains the BorgBase host
 4. Re-run wizard to reconfigure: Menu option **8**
+
+### Broken Pipe During Large Uploads
+If the log shows `client_loop: send disconnect: Broken pipe` or `Connection closed by remote host`, the SSH session was closed during or near the end of the upload. Restart the upload; Borg reuses existing chunks/checkpoints and should not resend everything.
+
+The default SSH keepalive settings are tuned for long desktop uploads. On Linux desktops, `systemd-inhibit` also blocks automatic sleep/idle and lid-switch suspend while the upload worker is running.
 
 ### Space Issues
 - Enable `PRUNE_BEFORE_CREATE=yes` to free space before uploads
