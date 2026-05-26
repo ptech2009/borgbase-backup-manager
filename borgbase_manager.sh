@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.10
+# BorgBase Backup Manager v1.8.12
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -19,6 +19,8 @@
 # - BUGFIX: Fixed {hostname}/{date} substitution using sed (bash brace issue)
 # - IMPROVED: Clear log messages after upload/download
 # - IMPROVED: AUTO_ACCEPT_HOSTKEY=yes by default (ssh-keyscan on first connect)
+# - IMPROVED: SSH keepalive defaults for long BorgBase uploads
+# - IMPROVED: Desktop sleep inhibition for long uploads on Linux workstations
 # - FIXED: Passphrase file is stored in plaintext but protected via chmod 600;
 #          wizard text now correctly states this instead of claiming encryption.
 #
@@ -40,7 +42,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.10"
+APP_VERSION="v1.8.12"
 
 STATUS_FIELD_WIDTH=49
 
@@ -110,6 +112,10 @@ KEEP_LAST="${KEEP_LAST:-14}"
 KEEP_LAST_PANZERBACKUP="${KEEP_LAST_PANZERBACKUP:-1}"
 PANZERBACKUP_ARCHIVE_NAME="${PANZERBACKUP_ARCHIVE_NAME:-panzerbackup-{hostname}-{date}}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
+SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL:-60}"
+SSH_SERVER_ALIVE_COUNT_MAX="${SSH_SERVER_ALIVE_COUNT_MAX:-30}"
+SSH_TCP_KEEPALIVE="${SSH_TCP_KEEPALIVE:-yes}"
+SSH_IPQOS="${SSH_IPQOS:-none}"
 BORG_LOCK_WAIT="${BORG_LOCK_WAIT:-60}"
 BORG_TEST_LOCK_WAIT="${BORG_TEST_LOCK_WAIT:-1}"
 # CHANGED: default is now "yes" so first-time connections work automatically
@@ -117,7 +123,8 @@ AUTO_ACCEPT_HOSTKEY="${AUTO_ACCEPT_HOSTKEY:-yes}"
 AUTO_TEST_SSH="${AUTO_TEST_SSH:-yes}"
 AUTO_TEST_REPO="${AUTO_TEST_REPO:-yes}"
 INHIBIT_SLEEP="${INHIBIT_SLEEP:-yes}"          # prevents sleep/idle while worker runs (systemd-inhibit)
-INHIBIT_WHAT="${INHIBIT_WHAT:-sleep:idle}"
+INHIBIT_WHAT="${INHIBIT_WHAT:-sleep:idle:handle-lid-switch}"
+INHIBIT_FALLBACK_WHAT="${INHIBIT_FALLBACK_WHAT:-sleep:idle}"
 INHIBIT_MODE="${INHIBIT_MODE:-block}"
 INHIBIT_WHY="${INHIBIT_WHY:-BorgBase Backup Manager}"
 
@@ -400,7 +407,7 @@ setup_borg_env() {
     local port_opt
     port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
     local ssh_base
-    ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT} ${port_opt}"
+    ssh_base="ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KNOWN_HOSTS} -o ConnectTimeout=${SSH_CONNECT_TIMEOUT} -o ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL} -o ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX} -o TCPKeepAlive=${SSH_TCP_KEEPALIVE} -o IPQoS=${SSH_IPQOS} ${port_opt}"
     
     if [[ -n "${SSH_KEY:-}" && -r "${SSH_KEY}" ]]; then
         export BORG_RSH="${ssh_base} -i ${SSH_KEY} -o IdentitiesOnly=yes"
@@ -690,7 +697,7 @@ test_ssh_auth() {
     user="$(_user_from_repo "${REPO}")"
     port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
     
-    out="$(ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" ${port_opt} ${SSH_KEY:+-i "$SSH_KEY" -o IdentitiesOnly=yes} "${user}@${host}" -- borg --version 2>&1 || true)"
+    out="$(ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -o ServerAliveInterval="${SSH_SERVER_ALIVE_INTERVAL}" -o ServerAliveCountMax="${SSH_SERVER_ALIVE_COUNT_MAX}" -o TCPKeepAlive="${SSH_TCP_KEEPALIVE}" -o IPQoS="${SSH_IPQOS}" ${port_opt} ${SSH_KEY:+-i "$SSH_KEY" -o IdentitiesOnly=yes} "${user}@${host}" -- borg --version 2>&1 || true)"
     echo "$out" >> "$LOG_FILE" 2>/dev/null || true
     
     if echo "$out" | grep -qiE 'host key verification failed|remote host identification has changed'; then
@@ -1156,7 +1163,7 @@ worker_upload() {
     echo "$(say "│ Quelle: ${src_dir}" "│ Source: ${src_dir}")" | tee -a "$LOG_FILE"
     echo "$(say '└─────────────────────────────────────────────────────────┘' '└─────────────────────────────────────────────────────────┘')" | tee -a "$LOG_FILE"
 
-    local rc=0
+    local rc=0 upload_error_hint=""
 
     if [[ "$is_panzer" == "yes" ]]; then
         local latest_img base img sha sfd
@@ -1199,6 +1206,10 @@ worker_upload() {
             rc="${PIPESTATUS[0]:-1}"
         fi
 
+        if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
+            upload_error_hint="ssh_disconnect"
+        fi
+
         rm -f "$include_file" "$create_out" 2>/dev/null || true
 
     else
@@ -1212,6 +1223,10 @@ worker_upload() {
             rc=0
         else
             rc="${PIPESTATUS[0]:-1}"
+        fi
+
+        if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
+            upload_error_hint="ssh_disconnect"
         fi
 
         rm -f "$create_out" 2>/dev/null || true
@@ -1240,6 +1255,12 @@ worker_upload() {
     echo "$(say '┃ ✗ UPLOAD FEHLGESCHLAGEN ┃' '┃ ✗ UPLOAD FAILED ┃')" | tee -a "$LOG_FILE"
     echo "$(say '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛' '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛')" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
+    if [[ "$upload_error_hint" == "ssh_disconnect" ]]; then
+        echo "$(say 'Hinweis: Die SSH-Verbindung wurde während/gegen Ende des Uploads getrennt (Broken pipe).' 'Hint: The SSH connection was closed during/near the end of the upload (Broken pipe).')" | tee -a "$LOG_FILE"
+        echo "$(say 'Das ist normalerweise kein Root-/Rechteproblem. Einfach den Upload erneut starten; Borg nutzt vorhandene Chunks/Checkpoints.' 'This is usually not a root/permission issue. Start the upload again; Borg will reuse existing chunks/checkpoints.')" | tee -a "$LOG_FILE"
+        echo "$(say 'Aktive SSH-Keepalive-Werte:' 'Active SSH keepalive values:') ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}, ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}, TCPKeepAlive=${SSH_TCP_KEEPALIVE}, IPQoS=${SSH_IPQOS}" | tee -a "$LOG_FILE"
+        echo "" | tee -a "$LOG_FILE"
+    fi
     echo "$(say ' Siehe Log für Details: '"$LOG_FILE" ' See log for details: '"$LOG_FILE")" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
 
@@ -1486,6 +1507,13 @@ KEEP_LAST_PANZERBACKUP="${KEEP_LAST_PANZERBACKUP}"
 PANZERBACKUP_ARCHIVE_NAME="${PANZERBACKUP_ARCHIVE_NAME}"
 UI_LANG="${UI_LANG}"
 AUTO_ACCEPT_HOSTKEY="yes"
+SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL}"
+SSH_SERVER_ALIVE_COUNT_MAX="${SSH_SERVER_ALIVE_COUNT_MAX}"
+SSH_TCP_KEEPALIVE="${SSH_TCP_KEEPALIVE}"
+SSH_IPQOS="${SSH_IPQOS}"
+INHIBIT_SLEEP="${INHIBIT_SLEEP}"
+INHIBIT_WHAT="${INHIBIT_WHAT}"
+INHIBIT_FALLBACK_WHAT="${INHIBIT_FALLBACK_WHAT}"
 EOF
     
     echo ""
@@ -1502,12 +1530,26 @@ EOF
 }
 
 # -------------------- Sleep inhibition (systemd-inhibit) --------------------
+supported_inhibit_what() {
+    local requested="${1:-sleep:idle}"
+    local fallback="${2:-sleep:idle}"
+
+    if systemd-inhibit --what="${requested}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} probe" true >/dev/null 2>&1; then
+        echo "$requested"
+        return 0
+    fi
+
+    echo "$fallback"
+}
+
 maybe_inhibit_exec() {
     if [[ "${INHIBIT_SLEEP:-yes}" != "yes" ]]; then return 0; fi
     if [[ -n "${_INHIBITED:-}" ]]; then return 0; fi
     if ! command -v systemd-inhibit >/dev/null 2>&1; then return 0; fi
     export _INHIBITED=1
-    exec systemd-inhibit --what="${INHIBIT_WHAT}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY}" "$0" "$@"
+    local inhibit_what
+    inhibit_what="$(supported_inhibit_what "${INHIBIT_WHAT}" "${INHIBIT_FALLBACK_WHAT}")"
+    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY}" "$0" "$@"
 }
 
 maybe_inhibit_reexec_worker() {
@@ -1517,7 +1559,10 @@ maybe_inhibit_reexec_worker() {
     if [[ -n "${_INHIBITED:-}" ]]; then return 0; fi
     if ! command -v systemd-inhibit >/dev/null 2>&1; then return 0; fi
     export _INHIBITED=1
-    exec systemd-inhibit --what="${INHIBIT_WHAT}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} (${mode})" "$0" --worker "$mode" "$@"
+    local inhibit_what
+    inhibit_what="$(supported_inhibit_what "${INHIBIT_WHAT}" "${INHIBIT_FALLBACK_WHAT}")"
+    echo "$(say 'Aktiviere Schutz gegen Energiesparmodus:' 'Enabling sleep/idle inhibition:') ${inhibit_what}" >> "$LOG_FILE" 2>/dev/null || true
+    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} (${mode})" "$0" --worker "$mode" "$@"
 }
 
 # -------------------- systemd user units --------------------
@@ -1876,6 +1921,8 @@ while true; do
             echo "$(say 'Quellverzeichnis:' 'Source Directory:') $SRC_DIR"
             echo "$(say 'SSH-Key:' 'SSH Key:') $SSH_KEY"
             echo "$(say 'Auto-Accept Hostkey:' 'Auto-Accept Hostkey:') ${AUTO_ACCEPT_HOSTKEY}"
+            echo "$(say 'SSH Keepalive:' 'SSH Keepalive:') ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}, ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}, TCPKeepAlive=${SSH_TCP_KEEPALIVE}, IPQoS=${SSH_IPQOS}"
+            echo "$(say 'Energiesparschutz:' 'Sleep inhibition:') INHIBIT_SLEEP=${INHIBIT_SLEEP}, INHIBIT_WHAT=${INHIBIT_WHAT}"
             echo ""
             echo "$(say '─── Aufbewahrungsrichtlinien ───' '─── Retention Policies ───')"
             echo "$(say 'Datenbackups behalten:' 'Keep data backups:') $KEEP_LAST $(say 'Stück' 'archives')"
