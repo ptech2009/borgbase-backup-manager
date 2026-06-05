@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.12
+# BorgBase Backup Manager v1.8.13
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -42,7 +42,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.12"
+APP_VERSION="v1.8.13"
 
 STATUS_FIELD_WIDTH=49
 
@@ -112,7 +112,7 @@ KEEP_LAST="${KEEP_LAST:-14}"
 KEEP_LAST_PANZERBACKUP="${KEEP_LAST_PANZERBACKUP:-1}"
 PANZERBACKUP_ARCHIVE_NAME="${PANZERBACKUP_ARCHIVE_NAME:-panzerbackup-{hostname}-{date}}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
-SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL:-60}"
+SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL:-20}"
 SSH_SERVER_ALIVE_COUNT_MAX="${SSH_SERVER_ALIVE_COUNT_MAX:-30}"
 SSH_TCP_KEEPALIVE="${SSH_TCP_KEEPALIVE:-yes}"
 SSH_IPQOS="${SSH_IPQOS:-none}"
@@ -130,6 +130,17 @@ INHIBIT_WHY="${INHIBIT_WHY:-BorgBase Backup Manager}"
 
 BORG_CHECKPOINT_INTERVAL="${BORG_CHECKPOINT_INTERVAL:-300}"   # seconds (helps survive interruptions)
 PRUNE_BEFORE_CREATE="${PRUNE_BEFORE_CREATE:-yes}"             # unattended cleanup before create
+AUTO_RETRY_ON_SSH_DISCONNECT="${AUTO_RETRY_ON_SSH_DISCONNECT:-yes}"  # auto-retry on Broken Pipe
+UPLOAD_MAX_RETRIES="${UPLOAD_MAX_RETRIES:-5}"                 # max retry attempts on SSH disconnect
+UPLOAD_RETRY_DELAY="${UPLOAD_RETRY_DELAY:-30}"                # seconds to wait before each retry
+
+# Desktop-Schonung: Borg mit niedriger CPU-/IO-Priorität ausführen, damit der
+# Rechner während des Uploads bedienbar bleibt (kein ruckelnder Mauszeiger).
+# Die Idle-IO-Klasse (ionice -c3) ist hier der wirksamste Hebel gegen UI-Hänger.
+LIMIT_RESOURCES="${LIMIT_RESOURCES:-yes}"     # yes = Borg via nice/ionice einbremsen
+NICE_LEVEL="${NICE_LEVEL:-19}"                # CPU-Niceness 0..19 (19 = maximal rücksichtsvoll)
+IONICE_CLASS="${IONICE_CLASS:-3}"             # IO-Klasse: 1=realtime 2=best-effort 3=idle
+IONICE_LEVEL="${IONICE_LEVEL:-7}"             # Priorität 0..7 innerhalb best-effort (bei idle ignoriert)
 
 # -------------------- Load config --------------------
 load_env() {
@@ -141,6 +152,25 @@ load_env() {
     if [[ -r "./.env" ]]; then
         # shellcheck disable=SC1091
         source "./.env"
+    fi
+}
+
+# -------------------- Resource limiting (desktop responsiveness) --------------------
+# Baut ein Präfix-Array (nice/ionice), das den borg-Aufrufen vorangestellt wird.
+# Die gespawnte ssh-Verbindung erbt die Prioritäten automatisch.
+BORG_NICE=()
+build_resource_prefix() {
+    BORG_NICE=()
+    [[ "${LIMIT_RESOURCES:-yes}" == "yes" ]] || return 0
+    if command -v nice >/dev/null 2>&1; then
+        BORG_NICE+=(nice -n "${NICE_LEVEL:-19}")
+    fi
+    if command -v ionice >/dev/null 2>&1; then
+        case "${IONICE_CLASS:-3}" in
+            3)   BORG_NICE+=(ionice -c 3) ;;                                  # idle: nur freie IO-Slots
+            1|2) BORG_NICE+=(ionice -c "${IONICE_CLASS}" -n "${IONICE_LEVEL:-7}") ;;
+            *)   : ;;                                                         # ungültig -> kein ionice
+        esac
     fi
 }
 
@@ -1145,8 +1175,8 @@ worker_upload() {
         echo "$(say "│ Keep last: ${keep_setting}" "│ Keep last: ${keep_setting}")" | tee -a "$LOG_FILE"
         echo "$(say '└───────────────────────────────────────────────────────┘' '└───────────────────────────────────────────────────────┘')" | tee -a "$LOG_FILE"
 
-        borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
-        borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+        "${BORG_NICE[@]}" borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+        "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
         echo "" | tee -a "$LOG_FILE"
     fi
 
@@ -1178,9 +1208,8 @@ worker_upload() {
         sha="${base}.img.zst.gpg.sha256"
         sfd="${base}.sfdisk"
 
-        local include_file create_out
+        local include_file create_out _attempt _max
         include_file="$(mktemp)"
-        create_out="$(mktemp)"
 
         {
             echo "$(basename "$img")"
@@ -1197,39 +1226,71 @@ worker_upload() {
         sed 's/^/  - /' "$include_file" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
 
-        if ( cd "$src_dir" && borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
-                --stats --progress --compression lz4 \
-                "${REPO}::${archive_name}" --paths-from-stdin < "$include_file" ) 2>&1 \
-                | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
-            rc=0
-        else
-            rc="${PIPESTATUS[0]:-1}"
-        fi
+        _attempt=0
+        _max=$(( UPLOAD_MAX_RETRIES + 1 ))
+        while (( ++_attempt <= _max )); do
+            if (( _attempt > 1 )); then
+                echo "" | tee -a "$LOG_FILE"
+                echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
+                            "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
+                sleep "${UPLOAD_RETRY_DELAY}"
+            fi
 
-        if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
-            upload_error_hint="ssh_disconnect"
-        fi
+            create_out="$(mktemp)"
+            if ( cd "$src_dir" && "${BORG_NICE[@]}" borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
+                    --stats --progress --compression lz4 \
+                    "${REPO}::${archive_name}" --paths-from-stdin < "$include_file" ) 2>&1 \
+                    | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
+                rc=0
+            else
+                rc="${PIPESTATUS[0]:-1}"
+            fi
 
-        rm -f "$include_file" "$create_out" 2>/dev/null || true
+            upload_error_hint=""
+            if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
+                upload_error_hint="ssh_disconnect"
+            fi
+            rm -f "$create_out" 2>/dev/null || true
+
+            [[ $rc -eq 0 ]] && break
+            [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
+            [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
+        done
+
+        rm -f "$include_file" 2>/dev/null || true
 
     else
-        local create_out
-        create_out="$(mktemp)"
+        local create_out _attempt _max
+        _attempt=0
+        _max=$(( UPLOAD_MAX_RETRIES + 1 ))
+        while (( ++_attempt <= _max )); do
+            if (( _attempt > 1 )); then
+                echo "" | tee -a "$LOG_FILE"
+                echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
+                            "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
+                sleep "${UPLOAD_RETRY_DELAY}"
+            fi
 
-        if borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
-                --stats --progress --compression lz4 \
-                "${REPO}::${archive_name}" "${src_dir}" 2>&1 \
-                | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
-            rc=0
-        else
-            rc="${PIPESTATUS[0]:-1}"
-        fi
+            create_out="$(mktemp)"
+            if "${BORG_NICE[@]}" borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
+                    --stats --progress --compression lz4 \
+                    "${REPO}::${archive_name}" "${src_dir}" 2>&1 \
+                    | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
+                rc=0
+            else
+                rc="${PIPESTATUS[0]:-1}"
+            fi
 
-        if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
-            upload_error_hint="ssh_disconnect"
-        fi
+            upload_error_hint=""
+            if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
+                upload_error_hint="ssh_disconnect"
+            fi
+            rm -f "$create_out" 2>/dev/null || true
 
-        rm -f "$create_out" 2>/dev/null || true
+            [[ $rc -eq 0 ]] && break
+            [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
+            [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
+        done
     fi
 
     if [[ "$rc" -eq 0 ]]; then
@@ -1242,8 +1303,8 @@ worker_upload() {
 
         if [[ "${PRUNE_AFTER_CREATE:-yes}" == "yes" && "${PRUNE:-yes}" == "yes" ]]; then
             set_job_status "$(say 'UPLOAD: Prune/Compact (nachher)...' 'UPLOAD: Prune/Compact (post)...')"
-            borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
-            borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+            "${BORG_NICE[@]}" borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+            "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
             set_job_status "$(say '✓ UPLOAD: Abgeschlossen' '✓ UPLOAD: Finished')"
         fi
 
@@ -1256,8 +1317,8 @@ worker_upload() {
     echo "$(say '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛' '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛')" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
     if [[ "$upload_error_hint" == "ssh_disconnect" ]]; then
-        echo "$(say 'Hinweis: Die SSH-Verbindung wurde während/gegen Ende des Uploads getrennt (Broken pipe).' 'Hint: The SSH connection was closed during/near the end of the upload (Broken pipe).')" | tee -a "$LOG_FILE"
-        echo "$(say 'Das ist normalerweise kein Root-/Rechteproblem. Einfach den Upload erneut starten; Borg nutzt vorhandene Chunks/Checkpoints.' 'This is usually not a root/permission issue. Start the upload again; Borg will reuse existing chunks/checkpoints.')" | tee -a "$LOG_FILE"
+        echo "$(say "Hinweis: Die SSH-Verbindung wurde nach ${UPLOAD_MAX_RETRIES} Neuversuch(en) wiederholt getrennt (Broken pipe)." \
+                    "Hint: The SSH connection was repeatedly dropped after ${UPLOAD_MAX_RETRIES} retry/retries (Broken pipe).")" | tee -a "$LOG_FILE"
         echo "$(say 'Aktive SSH-Keepalive-Werte:' 'Active SSH keepalive values:') ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}, ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}, TCPKeepAlive=${SSH_TCP_KEEPALIVE}, IPQoS=${SSH_IPQOS}" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
     fi
@@ -1514,6 +1575,10 @@ SSH_IPQOS="${SSH_IPQOS}"
 INHIBIT_SLEEP="${INHIBIT_SLEEP}"
 INHIBIT_WHAT="${INHIBIT_WHAT}"
 INHIBIT_FALLBACK_WHAT="${INHIBIT_FALLBACK_WHAT}"
+LIMIT_RESOURCES="${LIMIT_RESOURCES}"
+NICE_LEVEL="${NICE_LEVEL}"
+IONICE_CLASS="${IONICE_CLASS}"
+IONICE_LEVEL="${IONICE_LEVEL}"
 EOF
     
     echo ""
@@ -1712,6 +1777,7 @@ show_menu() {
 
 # -------------------- Main --------------------
 load_env
+build_resource_prefix
 
 # -------------------- CLI / Worker entrypoints --------------------
 if [[ "${1:-}" == "--worker" ]]; then

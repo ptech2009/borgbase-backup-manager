@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.13 - 2026-06-05
+
+- Run Borg create, prune, and compact with optional lower CPU and IO priority to keep Linux desktops responsive during long uploads.
+- Lowered the SSH keepalive interval for faster disconnect detection during BorgBase uploads.
+- Added automatic retry handling for SSH disconnects so Borg can resume from checkpoints.
+- Documented the new upload retry and desktop resource-limiting settings.
+
 ## v1.8.12 - 2026-05-26
 
 - Added SSH keepalive defaults for long BorgBase uploads.

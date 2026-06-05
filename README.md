@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.12-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.13-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -191,11 +191,14 @@ BORG_CHECKPOINT_INTERVAL=300     # Checkpoint interval in seconds
 
 # Connection settings
 SSH_CONNECT_TIMEOUT=10           # SSH connection timeout
-SSH_SERVER_ALIVE_INTERVAL=60     # Keep SSH sessions alive during long uploads
+SSH_SERVER_ALIVE_INTERVAL=20     # Keep SSH sessions alive during long uploads
 SSH_SERVER_ALIVE_COUNT_MAX=30    # Allow up to 30 missed keepalive replies
 SSH_TCP_KEEPALIVE=yes            # Enable TCP keepalives
 SSH_IPQOS=none                   # Avoid problematic QoS handling on some networks
 BORG_LOCK_WAIT=60               # Wait time for repo locks
+AUTO_RETRY_ON_SSH_DISCONNECT=yes # Retry interrupted SSH uploads automatically
+UPLOAD_MAX_RETRIES=5             # Retry attempts after SSH disconnects
+UPLOAD_RETRY_DELAY=30            # Seconds to wait before retrying
 AUTO_ACCEPT_HOSTKEY=no          # Auto-add SSH host key
 AUTO_TEST_SSH=yes               # Test SSH on startup
 AUTO_TEST_REPO=yes              # Test repo access on startup
@@ -205,6 +208,12 @@ INHIBIT_SLEEP=yes               # Prevent sleep during operations
 INHIBIT_WHAT=sleep:idle:handle-lid-switch  # What to inhibit
 INHIBIT_FALLBACK_WHAT=sleep:idle           # Fallback for older systemd versions
 INHIBIT_MODE=block              # Inhibit mode
+
+# Desktop responsiveness
+LIMIT_RESOURCES=yes             # Run Borg with lower CPU/IO priority
+NICE_LEVEL=19                   # CPU niceness, 19 = most considerate
+IONICE_CLASS=3                  # IO class, 3 = idle
+IONICE_LEVEL=7                  # IO priority for best-effort class
 ```
 
 ## 🔄 Systemd Integration
