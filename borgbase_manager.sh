@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.14
+# BorgBase Backup Manager v1.8.15
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -9,6 +9,8 @@
 # - AUTO-DETECT: Automatically finds newest mounted Panzerbackup
 # - FIXED: Detects any mount whose name contains "panzerbackup" (any spelling),
 #          e.g. /mnt/Panzerbackup-OAI - not just /media/* and /run/media/*
+# - PZB: Recognizes the single-file .pzb container of Panzerbackup 3.x
+#        (Proxmox disaster recovery) in addition to the RAW *.img.zst images
 # - INTERACTIVE PRUNE: Shows archives before deletion for safety
 # - UI: Always handles DE/EN selection, better progress output.
 # - ROBUSTNESS: Better error handling and connection testing.
@@ -43,7 +45,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.14"
+APP_VERSION="v1.8.15"
 
 STATUS_FIELD_WIDTH=49
 
@@ -581,17 +583,22 @@ ensure_known_hosts() {
 # Panzerbackup-OAI, my_panzerbackup_2, ...).
 PANZER_NAME_RE='[Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp]'
 
-# Emits all Panzerbackup image files of a directory (NUL separated).
+# Emits all Panzerbackup backup files of a directory (NUL separated).
+# Two artifact shapes exist: the RAW image (*.img.zst, optionally GPG-wrapped)
+# and the single-file container of the Proxmox disaster recovery mode
+# (panzer_<name>_<date>.pzb, Panzerbackup >= 3.0.0), which carries its GPG
+# envelope inside the same file name.
 panzer_image_files() {
     local dir="${1:-}"
     [[ -n "$dir" && -d "$dir" ]] || return 0
     find "$dir" -maxdepth 1 -type f \
-        \( -iname "panzer_*.img.zst.gpg" -o -iname "panzer_*.img.zst" \
-           -o -iname "*panzerbackup*.img.zst.gpg" -o -iname "*panzerbackup*.img.zst" \) \
+        \( -iname "panzer_*.img.zst.gpg" -o -iname "panzer_*.img.zst" -o -iname "panzer_*.pzb" \
+           -o -iname "*panzerbackup*.img.zst.gpg" -o -iname "*panzerbackup*.img.zst" \
+           -o -iname "*panzerbackup*.pzb" \) \
         ! -iname "*.part" -print0 2>/dev/null || true
 }
 
-# Prints the newest Panzerbackup image file of a directory.
+# Prints the newest Panzerbackup backup file of a directory.
 panzer_newest_image() {
     local dir="${1:-}"
     local f newest="" newest_time=0 mtime
@@ -1241,17 +1248,21 @@ worker_upload() {
         local latest_img base img sha sfd
         latest_img="$(panzer_newest_image "$src_dir" || true)"
         if [[ -z "$latest_img" ]]; then
-            set_job_status "$(say 'UPLOAD: FEHLER – Kein Panzerbackup-Image (*.img.zst[.gpg]) gefunden' 'UPLOAD: ERROR – No Panzerbackup image (*.img.zst[.gpg]) found')"
-            echo -e "${R}$(say '✗ FEHLER: Kein Panzerbackup-Image (*.img.zst[.gpg]) gefunden' '✗ ERROR: No Panzerbackup image (*.img.zst[.gpg]) found')${NC}" | tee -a "$LOG_FILE"
+            set_job_status "$(say 'UPLOAD: FEHLER – Kein Panzerbackup-Image (*.img.zst[.gpg] / *.pzb) gefunden' 'UPLOAD: ERROR – No Panzerbackup image (*.img.zst[.gpg] / *.pzb) found')"
+            echo -e "${R}$(say '✗ FEHLER: Kein Panzerbackup-Image (*.img.zst[.gpg] / *.pzb) gefunden' '✗ ERROR: No Panzerbackup image (*.img.zst[.gpg] / *.pzb) found')${NC}" | tee -a "$LOG_FILE"
             return 1
         fi
         img="$latest_img"
-        if [[ "$img" == *.img.zst.gpg ]]; then
+        if [[ "$img" == *.pzb ]]; then
+            base="${img%.pzb}"
+        elif [[ "$img" == *.img.zst.gpg ]]; then
             base="${img%.img.zst.gpg}"
         else
             base="${img%.img.zst}"
         fi
         sha="${img}.sha256"
+        # A .pzb carries its partition table inside the container, so no
+        # .sfdisk sidecar exists - it is added only when it is really there.
         sfd="${base}.sfdisk"
 
         local include_file create_out _attempt _max
@@ -1978,7 +1989,7 @@ while true; do
                     if [[ -n "$latest_img_preview" ]]; then
                         echo -e "${C}$(say 'Lokale Datei für Upload:' 'Local file for upload:')${NC} $(basename -- "$latest_img_preview")"
                     else
-                        echo -e "${Y}$(say '⚠ Kein Panzerbackup-Image (*.img.zst[.gpg]) im Quellverzeichnis gefunden' '⚠ No Panzerbackup image (*.img.zst[.gpg]) found in source directory')${NC}"
+                        echo -e "${Y}$(say '⚠ Kein Panzerbackup-Image (*.img.zst[.gpg] / *.pzb) im Quellverzeichnis gefunden' '⚠ No Panzerbackup image (*.img.zst[.gpg] / *.pzb) found in source directory')${NC}"
                     fi
                     echo ""
                 fi

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.15 - 2026-09-05
+
+- Recognizes the single-file `.pzb` container that Panzerbackup 3.x writes in Proxmox disaster recovery mode (`panzer_<name>_<date>.pzb`), so auto-detection, hostname extraction, and upload find it again next to the existing RAW `*.img.zst[.gpg]` images.
+- The upload adds the matching `.pzb.sha256` and the `LATEST_OK` links; a `.sfdisk` sidecar is no longer expected for `.pzb`, because the partition table lives inside the container.
+- Messages about a missing backup file now name both artifact types.
+
 ## v1.8.14 - 2026-08-22
 
 - Auto-detection now accepts any directory whose name contains "panzerbackup" in any spelling, for example `Panzerbackup-OAI` or `PANZERBACKUP_2`.

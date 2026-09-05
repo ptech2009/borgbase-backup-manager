@@ -3,3 +3,6 @@
 *.tmp
 *.pid
 __pycache__/
+
+# Lokale Mint-Variante, nicht veroeffentlichen
+borgbase_manager_mint.sh
