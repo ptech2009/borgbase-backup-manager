@@ -43,7 +43,7 @@ A secure, production-ready backup management tool for uploading and downloading 
 - **BorgBackup** 1.2 or higher
 - **Bash** 4.0 or higher
 - **SSH** access to BorgBase repository
-- **Panzerbackup** artifacts (.img.zst.gpg files)
+- **Panzerbackup** artifacts (`.img.zst[.gpg]` RAW images or `.pzb` containers from Panzerbackup 3.x)
 - **Optional**: findmnt, ssh-keygen, ssh-keyscan, stdbuf, systemd-inhibit for enhanced features
 
 ## 🚀 Quick Start
