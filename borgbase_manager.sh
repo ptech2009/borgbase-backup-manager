@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.13
+# BorgBase Backup Manager v1.8.14
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -7,7 +7,8 @@
 # - SMART PRUNE: Different retention policies for Panzerbackup vs. Data backups
 # - INTERACTIVE CLEANUP: Manual selection with immediate deletion
 # - AUTO-DETECT: Automatically finds newest mounted Panzerbackup
-# - FIXED: Detects mounted Panzerbackup under /media/* and /run/media/*, not only /media/$USER
+# - FIXED: Detects any mount whose name contains "panzerbackup" (any spelling),
+#          e.g. /mnt/Panzerbackup-OAI - not just /media/* and /run/media/*
 # - INTERACTIVE PRUNE: Shows archives before deletion for safety
 # - UI: Always handles DE/EN selection, better progress output.
 # - ROBUSTNESS: Better error handling and connection testing.
@@ -42,7 +43,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.13"
+APP_VERSION="v1.8.14"
 
 STATUS_FIELD_WIDTH=49
 
@@ -575,15 +576,59 @@ ensure_known_hosts() {
 }
 
 # -------------------- Panzerbackup Auto-Detection --------------------
+# A directory counts as a Panzerbackup target as soon as the word "panzerbackup"
+# appears anywhere in its name, in any spelling (Panzerbackup, PANZERBACKUP,
+# Panzerbackup-OAI, my_panzerbackup_2, ...).
+PANZER_NAME_RE='[Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp]'
+
+# Emits all Panzerbackup image files of a directory (NUL separated).
+panzer_image_files() {
+    local dir="${1:-}"
+    [[ -n "$dir" && -d "$dir" ]] || return 0
+    find "$dir" -maxdepth 1 -type f \
+        \( -iname "panzer_*.img.zst.gpg" -o -iname "panzer_*.img.zst" \
+           -o -iname "*panzerbackup*.img.zst.gpg" -o -iname "*panzerbackup*.img.zst" \) \
+        ! -iname "*.part" -print0 2>/dev/null || true
+}
+
+# Prints the newest Panzerbackup image file of a directory.
+panzer_newest_image() {
+    local dir="${1:-}"
+    local f newest="" newest_time=0 mtime
+    while IFS= read -r -d '' f; do
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        if (( mtime > newest_time )); then
+            newest_time=$mtime
+            newest="$f"
+        fi
+    done < <(panzer_image_files "$dir")
+    [[ -n "$newest" ]] || return 1
+    echo "$newest"
+}
+
+# Directories that are scanned for Panzerbackup folders.
+panzer_search_bases() {
+    local base
+    for base in /media /run/media /mnt /srv /data; do
+        [[ -d "$base" ]] && echo "$base"
+    done
+    # Every currently mounted filesystem whose mountpoint carries the name,
+    # no matter where it is mounted (e.g. /mnt/Panzerbackup-OAI).
+    while IFS= read -r base; do
+        [[ -n "$base" && -d "$base" ]] && echo "$base"
+    done < <(awk '{ gsub(/\\040/, " ", $2); print $2 }' /proc/mounts 2>/dev/null | grep -i 'panzerbackup' || true)
+}
+
 detect_newest_panzerbackup() {
-    local search_bases=()
-    [[ -d "/media" ]] && search_bases+=( "/media" )
-    [[ -d "/run/media" ]] && search_bases+=( "/run/media" )
-    [[ ${#search_bases[@]} -eq 0 ]] && return 1
+    local bases=()
+    mapfile -t bases < <(panzer_search_bases | awk 'NF && !seen[$0]++')
+    [[ ${#bases[@]} -eq 0 ]] && return 1
     
     local dirs=()
     local base dir
-    for base in "${search_bases[@]}"; do
+    for base in "${bases[@]}"; do
+        # The mountpoint itself may already be the Panzerbackup directory.
+        [[ "$(basename -- "$base")" =~ $PANZER_NAME_RE ]] && dirs+=( "$base" )
         while IFS= read -r -d '' dir; do
             dirs+=( "$dir" )
         done < <(find "$base" -mindepth 1 -maxdepth 3 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
@@ -592,29 +637,34 @@ detect_newest_panzerbackup() {
     [[ ${#dirs[@]} -eq 0 ]] && return 1
     
     local unique_dirs=()
-    mapfile -t unique_dirs < <(printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++')
+    mapfile -t unique_dirs < <(printf '%s\n' "${dirs[@]}" | awk 'NF && !seen[$0]++')
     [[ ${#unique_dirs[@]} -eq 0 ]] && return 1
     
     local newest_time=0
     local newest_dir=""
+    local fallback_time=0
+    local fallback_dir=""
+    local img mtime
     
     for dir in "${unique_dirs[@]}"; do
-        local files=()
-        while IFS= read -r -d '' f; do
-            files+=( "$f" )
-        done < <(find "$dir" -maxdepth 1 -type f \( -name "panzer_*.img.zst.gpg" -o -name "panzer_*.img.zst" \) ! -name "*.part" -print0 2>/dev/null || true)
-        
-        for f in "${files[@]}"; do
-            local mtime
-            mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        if img="$(panzer_newest_image "$dir")"; then
+            mtime=$(stat -c %Y "$img" 2>/dev/null || echo 0)
             if (( mtime > newest_time )); then
                 newest_time=$mtime
                 newest_dir="$dir"
             fi
-        done
+        else
+            # Name matches but no image (yet) - keep as fallback.
+            mtime=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
+            if (( mtime > fallback_time )); then
+                fallback_time=$mtime
+                fallback_dir="$dir"
+            fi
+        fi
     done
     
     [[ -n "$newest_dir" ]] && { echo "$newest_dir"; return 0; }
+    [[ -n "$fallback_dir" ]] && { echo "$fallback_dir"; return 0; }
     return 1
 }
 
@@ -624,27 +674,17 @@ extract_hostname_from_panzerbackup() {
     [[ ! -d "$dir" ]] && return 1
     
     local newest_file=""
-    local newest_time=0
-    
-    while IFS= read -r -d '' f; do
-        local mtime
-        mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-        if (( mtime > newest_time )); then
-            newest_time=$mtime
-            newest_file="$f"
-        fi
-    done < <(find "$dir" -maxdepth 1 -type f \( -name "panzer_*.img.zst.gpg" -o -name "panzer_*.img.zst" \) ! -name "*.part" -print0 2>/dev/null || true)
-    
+    newest_file="$(panzer_newest_image "$dir")" || return 1
     [[ -z "$newest_file" ]] && return 1
     
     local basename
-    basename="$(basename "$newest_file")"
+    basename="$(basename -- "$newest_file")"
     
-    if [[ "$basename" =~ ^panzer_(.+)-panzerbackup ]]; then
+    if [[ "$basename" =~ ^[Pp][Aa][Nn][Zz][Ee][Rr]_(.+)-${PANZER_NAME_RE} ]]; then
         echo "${BASH_REMATCH[1]}"; return 0
-    elif [[ "$basename" =~ ^panzer_(.+)_panzerbackup ]]; then
+    elif [[ "$basename" =~ ^[Pp][Aa][Nn][Zz][Ee][Rr]_(.+)_${PANZER_NAME_RE} ]]; then
         echo "${BASH_REMATCH[1]}"; return 0
-    elif [[ "$basename" =~ ^panzer_([^_]+) ]]; then
+    elif [[ "$basename" =~ ^[Pp][Aa][Nn][Zz][Ee][Rr]_([^_]+) ]]; then
         echo "${BASH_REMATCH[1]}"; return 0
     fi
     
@@ -655,8 +695,8 @@ extract_hostname_from_panzerbackup() {
 # -------------------- Backup type detection --------------------
 is_panzerbackup_source() {
     local dir="$1"
-    [[ "$dir" =~ [Pp][Aa][Nn][Zz][Ee][Rr][Bb][Aa][Cc][Kk][Uu][Pp] ]] && return 0
-    find "$dir" -maxdepth 1 -type f \( -name "panzer_*.img.zst.gpg" -o -name "panzer_*.img.zst" \) ! -name "*.part" -print0 2>/dev/null | grep -qz . && return 0
+    [[ "$dir" =~ $PANZER_NAME_RE ]] && return 0
+    panzer_image_files "$dir" | grep -qz . && return 0
     return 1
 }
 
@@ -680,15 +720,17 @@ detect_src_dir() {
         return 0
     fi
     
-    local possible=("$HOME/panzerbackup" "/home/$USER/panzerbackup")
-    for d in "${possible[@]}"; do
-        if [[ -d "$d" ]]; then SRC_DIR="$d"; return 0; fi
-    done
+    local d
+    while IFS= read -r -d '' d; do
+        [[ -d "$d" ]] || continue
+        SRC_DIR="$d"
+        return 0
+    done < <(find "$HOME" -mindepth 1 -maxdepth 2 -type d -iname "*panzerbackup*" -print0 2>/dev/null || true)
     
     echo -e "${R}$(say 'FEHLER: Kein Panzerbackup-Verzeichnis gefunden!' 'ERROR: No Panzerbackup directory found!')${NC}"
     echo ""
     echo "$(say 'Bitte stellen Sie sicher, dass:' 'Please ensure that:')"
-    echo "  $(say '1) Ein USB-Stick mit Panzerbackup gemountet ist (z. B. unter /media/<Benutzer>/... oder /run/media/<Benutzer>/...)' '1) A USB stick with Panzerbackup is mounted (for example under /media/<user>/... or /run/media/<user>/...)')"
+    echo "  $(say '1) Ein Datenträger mit "panzerbackup" im Namen gemountet ist (z. B. /media/<Benutzer>/..., /run/media/<Benutzer>/... oder /mnt/Panzerbackup-XYZ)' '1) A volume with "panzerbackup" in its name is mounted (for example /media/<user>/..., /run/media/<user>/... or /mnt/Panzerbackup-XYZ)')"
     echo "  $(say '2) Oder konfigurieren Sie SRC_DIR manuell' '2) Or configure SRC_DIR manually')"
     echo ""
     return 1
@@ -1197,28 +1239,33 @@ worker_upload() {
 
     if [[ "$is_panzer" == "yes" ]]; then
         local latest_img base img sha sfd
-        latest_img="$(ls -1t "${src_dir}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
+        latest_img="$(panzer_newest_image "$src_dir" || true)"
         if [[ -z "$latest_img" ]]; then
-            set_job_status "$(say 'UPLOAD: FEHLER – Keine panzer_*.img.zst.gpg gefunden' 'UPLOAD: ERROR – No panzer_*.img.zst.gpg found')"
-            echo -e "${R}$(say '✗ FEHLER: Keine panzer_*.img.zst.gpg gefunden' '✗ ERROR: No panzer_*.img.zst.gpg found')${NC}" | tee -a "$LOG_FILE"
+            set_job_status "$(say 'UPLOAD: FEHLER – Kein Panzerbackup-Image (*.img.zst[.gpg]) gefunden' 'UPLOAD: ERROR – No Panzerbackup image (*.img.zst[.gpg]) found')"
+            echo -e "${R}$(say '✗ FEHLER: Kein Panzerbackup-Image (*.img.zst[.gpg]) gefunden' '✗ ERROR: No Panzerbackup image (*.img.zst[.gpg]) found')${NC}" | tee -a "$LOG_FILE"
             return 1
         fi
-        base="${latest_img%.img.zst.gpg}"
-        img="${base}.img.zst.gpg"
-        sha="${base}.img.zst.gpg.sha256"
+        img="$latest_img"
+        if [[ "$img" == *.img.zst.gpg ]]; then
+            base="${img%.img.zst.gpg}"
+        else
+            base="${img%.img.zst}"
+        fi
+        sha="${img}.sha256"
         sfd="${base}.sfdisk"
 
         local include_file create_out _attempt _max
         include_file="$(mktemp)"
 
         {
-            echo "$(basename "$img")"
-            echo "$(basename "$sha")"
-            echo "$(basename "$sfd")"
+            basename -- "$img"
+            [[ -f "$sha" ]] && basename -- "$sha"
+            [[ -f "$sfd" ]] && basename -- "$sfd"
             [[ -f "${src_dir}/LATEST_OK" ]] && echo "LATEST_OK"
             [[ -f "${src_dir}/LATEST_OK.sha256" ]] && echo "LATEST_OK.sha256"
             [[ -f "${src_dir}/LATEST_OK.sfdisk" ]] && echo "LATEST_OK.sfdisk"
             [[ -f "${src_dir}/panzerbackup.log" ]] && echo "panzerbackup.log"
+            true
         } > "$include_file"
 
         echo "" | tee -a "$LOG_FILE"
@@ -1927,11 +1974,11 @@ while true; do
                 echo ""
 
                 if is_panzerbackup_source "$SRC_DIR"; then
-                    latest_img_preview="$(ls -1t "${SRC_DIR}"/panzer_*.img.zst.gpg 2>/dev/null | head -n1 || true)"
+                    latest_img_preview="$(panzer_newest_image "$SRC_DIR" || true)"
                     if [[ -n "$latest_img_preview" ]]; then
-                        echo -e "${C}$(say 'Lokale Datei für Upload:' 'Local file for upload:')${NC} $(basename "$latest_img_preview")"
+                        echo -e "${C}$(say 'Lokale Datei für Upload:' 'Local file for upload:')${NC} $(basename -- "$latest_img_preview")"
                     else
-                        echo -e "${Y}$(say '⚠ Keine panzer_*.img.zst.gpg im Quellverzeichnis gefunden' '⚠ No panzer_*.img.zst.gpg found in source directory')${NC}"
+                        echo -e "${Y}$(say '⚠ Kein Panzerbackup-Image (*.img.zst[.gpg]) im Quellverzeichnis gefunden' '⚠ No Panzerbackup image (*.img.zst[.gpg]) found in source directory')${NC}"
                     fi
                     echo ""
                 fi

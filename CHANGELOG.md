@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.14 - 2026-08-22
+
+- Auto-detection now accepts any directory whose name contains "panzerbackup" in any spelling, for example `Panzerbackup-OAI` or `PANZERBACKUP_2`.
+- Added `/mnt`, `/srv`, and `/data` to the search paths and additionally scans every mounted filesystem whose mountpoint carries the name, so volumes mounted outside `/media` and `/run/media` are found.
+- A matching directory without image files is now used as a fallback instead of aborting with "no Panzerbackup directory found".
+- Image detection, hostname extraction, and upload file selection now match case-insensitively and also accept unencrypted `*.img.zst` images.
+- Checksum and partition-table files are only added to the upload when they exist.
+
 ## v1.8.13 - 2026-06-05
 
 - Run Borg create, prune, and compact with optional lower CPU and IO priority to keep Linux desktops responsive during long uploads.
