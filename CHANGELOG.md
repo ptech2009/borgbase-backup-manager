@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.16 - 2026-09-23
+
+- Fault tolerance after reboot, crash, or kill: the worker PID file now stores the boot ID and process start time, so a leftover or reused PID is no longer mistaken for a running job. This matters under `sudo`, where the status lives in `/root/.cache` and survives a reboot.
+- A status that still says "running" without a live worker is replaced with "INTERRUPTED (reboot/abort) – please start again". Borg resumes from its last checkpoint on the next upload.
+- The worker traps SIGTERM, SIGHUP, and SIGINT and never leaves a "running" status behind. Status files are written atomically.
+- Live progress shows the last status and distinguishes "job finished" from "no job running". "Clear status" reports when a job is still running.
+
 ## v1.8.15 - 2026-09-05
 
 - Recognizes the single-file `.pzb` container that Panzerbackup 3.x writes in Proxmox disaster recovery mode (`panzer_<name>_<date>.pzb`), so auto-detection, hostname extraction, and upload find it again next to the existing RAW `*.img.zst[.gpg]` images.

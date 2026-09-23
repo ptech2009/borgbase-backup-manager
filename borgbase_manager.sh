@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.15
+# BorgBase Backup Manager v1.8.16
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -9,6 +9,8 @@
 # - AUTO-DETECT: Automatically finds newest mounted Panzerbackup
 # - FIXED: Detects any mount whose name contains "panzerbackup" (any spelling),
 #          e.g. /mnt/Panzerbackup-OAI - not just /media/* and /run/media/*
+# - FAULT TOLERANT: Detects jobs interrupted by reboot/crash/kill (PID + boot_id
+#        + start time) instead of showing a stale "running" status forever
 # - PZB: Recognizes the single-file .pzb container of Panzerbackup 3.x
 #        (Proxmox disaster recovery) in addition to the RAW *.img.zst images
 # - INTERACTIVE PRUNE: Shows archives before deletion for safety
@@ -45,7 +47,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.15"
+APP_VERSION="v1.8.16"
 
 STATUS_FIELD_WIDTH=49
 
@@ -186,10 +188,45 @@ pause() {
 }
 
 # -------------------- Status (JOB + CONN) --------------------
-set_job_status() { echo "$1" > "$JOB_STATUS_FILE"; }
-set_conn_status() { echo "$1" > "$CONN_STATUS_FILE"; }
+# Atomic write (tmp + rename) so readers never see a half-written file.
+atomic_write() {
+    local file="$1" content="$2" tmp
+    tmp="${file}.tmp.$$"
+    if printf '%s\n' "$content" > "$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    printf '%s\n' "$content" > "$file" 2>/dev/null || true
+}
+
+set_job_status() { atomic_write "$JOB_STATUS_FILE" "$1"; }
+set_conn_status() { atomic_write "$CONN_STATUS_FILE" "$1"; }
+
+# A status that claims a job is in progress (not finished, not failed).
+job_status_is_active() {
+    local s="$1"
+    [[ "$s" == "✓"* || "$s" == "✗"* ]] && return 1
+    [[ "$s" == *"FEHLER"* || "$s" == *"ERROR"* || "$s" == *"UNTERBROCHEN"* || "$s" == *"INTERRUPTED"* ]] && return 1
+    [[ "$s" == UPLOAD* || "$s" == DOWNLOAD* || "$s" == JOB* || "$s" == Job* ]]
+}
+
+# If the status says "running" but no worker is alive (reboot, crash, kill -9,
+# power loss), replace it with a clear "interrupted" status instead of lying.
+reconcile_job_status() {
+    [[ -s "$JOB_STATUS_FILE" ]] || return 0
+    local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
+    job_status_is_active "$s" || return 0
+    is_running && return 0
+    local kind="JOB"
+    [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
+    [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+    set_job_status "$(say "✗ ${kind}: UNTERBROCHEN (Neustart/Abbruch) – bitte erneut starten" \
+                          "✗ ${kind}: INTERRUPTED (reboot/abort) – please start again")"
+    rm -f "$START_FILE" 2>/dev/null || true
+}
 
 get_job_status() {
+    reconcile_job_status
     if [[ -s "$JOB_STATUS_FILE" ]]; then
         tail -n1 "$JOB_STATUS_FILE"
     else
@@ -245,18 +282,95 @@ get_conn_status_formatted() {
 }
 
 # -------------------- Process tracking --------------------
+# The PID file stores "<pid> <boot_id> <starttime>". A bare PID is not enough:
+# the status dir may survive a reboot (e.g. /root/.cache under sudo) and the
+# PID can be reused by an unrelated process afterwards.
+current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "-"; }
+
+# Field 22 of /proc/<pid>/stat (start time in clock ticks since boot).
+proc_starttime() {
+    local stat
+    stat="$(cat "/proc/${1}/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    local -a f
+    read -r -a f <<< "$stat" || true
+    [[ -n "${f[19]:-}" ]] || return 1
+    echo "${f[19]}"
+}
+
+write_pid_record() {
+    local pid="$1" st
+    st="$(proc_starttime "$pid" || echo "-")"
+    atomic_write "$PID_FILE" "${pid} $(current_boot_id) ${st}"
+}
+
+read_pid() {
+    local pid=""
+    [[ -s "$PID_FILE" ]] && read -r pid _ < "$PID_FILE" 2>/dev/null || true
+    echo "${pid:--}"
+}
+
+drop_stale_pid() { rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true; }
+
 is_running() {
-    [[ -f "$PID_FILE" ]] || return 1
-    local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    [[ -n "$pid" ]] || { rm -f "$PID_FILE"; return 1; }
-    ps -p "$pid" >/dev/null 2>&1 && return 0
-    rm -f "$PID_FILE"
-    return 1
+    [[ -s "$PID_FILE" ]] || return 1
+    local pid="" boot="" st=""
+    read -r pid boot st < "$PID_FILE" 2>/dev/null || true
+    [[ "$pid" =~ ^[0-9]+$ ]] || { drop_stale_pid; return 1; }
+
+    # Different boot -> the worker cannot be alive anymore.
+    if [[ -n "$boot" && "$boot" != "-" && "$boot" != "$(current_boot_id)" ]]; then
+        drop_stale_pid; return 1
+    fi
+    if [[ ! -d "/proc/${pid}" ]] && ! ps -p "$pid" >/dev/null 2>&1; then
+        drop_stale_pid; return 1
+    fi
+    # PID reused by another process?
+    if [[ -n "$st" && "$st" != "-" ]]; then
+        local cur; cur="$(proc_starttime "$pid" || true)"
+        if [[ -n "$cur" && "$cur" != "$st" ]]; then
+            drop_stale_pid; return 1
+        fi
+    elif [[ -r "/proc/${pid}/cmdline" ]]; then
+        # Legacy record (PID only): require that it still is our worker.
+        if ! tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qE -- '--worker|systemd-inhibit'; then
+            drop_stale_pid; return 1
+        fi
+    fi
+    return 0
 }
 
 clear_status() {
-    if ! is_running; then
-        rm -f "$JOB_STATUS_FILE" "$CONN_STATUS_FILE" "$START_FILE" "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+    if is_running; then
+        return 1
+    fi
+    rm -f "$JOB_STATUS_FILE" "$CONN_STATUS_FILE" "$START_FILE" "$PID_FILE" "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+}
+
+# Worker bookkeeping: register this process, and on any exit (error, SIGTERM,
+# SIGHUP, Ctrl+C) remove our PID file and never leave a "running" status behind.
+worker_register() {
+    write_pid_record "$$"
+    date +%s > "$START_FILE" 2>/dev/null || true
+    trap worker_on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+worker_on_exit() {
+    local rc=$?
+    local pid; pid="$(read_pid)"
+    if [[ "$pid" == "$$" ]]; then
+        rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
+    fi
+    local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
+    if job_status_is_active "$s"; then
+        local kind="JOB"
+        [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
+        [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+        set_job_status "$(say "✗ ${kind}: UNTERBROCHEN (rc=${rc}) – siehe Log" "✗ ${kind}: INTERRUPTED (rc=${rc}) – see log")"
+        echo "$(say "Worker beendet (rc=${rc}), Job war noch aktiv: $(date)" "Worker exited (rc=${rc}) while job was active: $(date)")" >> "$LOG_FILE" 2>/dev/null || true
     fi
 }
 
@@ -1154,7 +1268,7 @@ start_detached_worker() {
     nohup setsid "$0" --worker "$mode" "$@" </dev/null >/dev/null 2>&1 &
     local pid=$!
 
-    echo "$pid" > "$PID_FILE"
+    write_pid_record "$pid"
     date +%s > "$START_FILE" 2>/dev/null || true
     set_job_status "$(say "JOB gestartet (PID: $pid)" "Job started (PID: $pid)")"
 }
@@ -1164,13 +1278,7 @@ worker_upload() {
     local src_dir="${1:-$SRC_DIR}"
 
     ensure_logfile_writable
-    echo "$$" > "$PID_FILE"
-    date +%s > "$START_FILE" 2>/dev/null || true
-
-    cleanup_worker_files() {
-        rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
-    }
-    trap cleanup_worker_files EXIT
+    worker_register
 
     set_job_status "$(say 'UPLOAD: Wird vorbereitet...' 'UPLOAD: Preparing...')"
 
@@ -1449,13 +1557,7 @@ worker_download() {
     fi
 
     ensure_logfile_writable
-    echo "$$" > "$PID_FILE"
-    date +%s > "$START_FILE" 2>/dev/null || true
-
-    cleanup_worker_files() {
-        rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
-    }
-    trap cleanup_worker_files EXIT
+    worker_register
 
     set_job_status "$(say 'DOWNLOAD: Wird vorbereitet...' 'DOWNLOAD: Preparing...')"
 
@@ -1764,13 +1866,15 @@ live_progress_view() {
     ensure_logfile_writable
 
     local key=""
+    local was_running=0
+    is_running && was_running=1
     trap 'key="q"' INT
 
     while true; do
         clear 2>/dev/null || true
         echo "============================================================"
         echo "  $(say 'Live Progress – Log folgen' 'Live progress – follow log')"
-        echo "  $(say "PID: $(cat "$PID_FILE" 2>/dev/null || echo '-')" "PID: $(cat "$PID_FILE" 2>/dev/null || echo '-')")"
+        echo "  PID: $(read_pid)"
         echo "  $(say "Job: $(get_job_status_formatted)" "Job: $(get_job_status_formatted)")"
         echo "  $(say "Repo: $(get_conn_status_formatted)" "Repo: $(get_conn_status_formatted)")"
         if [[ -f "$LOG_FILE" ]]; then
@@ -1796,7 +1900,12 @@ live_progress_view() {
 
         if ! is_running; then
             echo ""
-            echo -e "${Y}$(say 'Kein laufender Job mehr erkannt.' 'No running job detected anymore.')${NC}"
+            if (( was_running )); then
+                echo -e "${Y}$(say 'Job ist beendet.' 'Job has finished.')${NC}"
+            else
+                echo -e "${Y}$(say 'Aktuell läuft kein Job.' 'No job is currently running.')${NC}"
+            fi
+            echo -e "$(say 'Letzter Status:' 'Last status:') $(get_job_status_formatted)"
             echo "$(say 'Drücke eine Taste...' 'Press any key...')"
             read -r -n 1 -s || true
             break
@@ -2077,8 +2186,11 @@ while true; do
             pause
             ;;
         7)
-            clear_status
-            echo "Status cleared."
+            if clear_status; then
+                echo "$(say 'Status gelöscht.' 'Status cleared.')"
+            else
+                echo -e "${Y}$(say 'Job läuft noch – Status bleibt erhalten.' 'Job still running – status kept.')${NC}"
+            fi
             sleep 1
             ;;
         8)
