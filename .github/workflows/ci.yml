@@ -3,12 +3,34 @@ name: CI
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - "**.png"
+      - "**.jpg"
+      - "**.gif"
+      - "**.svg"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - "**.png"
+      - "**.jpg"
+      - "**.gif"
+      - "**.svg"
   workflow_dispatch:
+
+# Ein neuer Push auf denselben Branch/PR bricht den veralteten Lauf ab.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   shell-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
