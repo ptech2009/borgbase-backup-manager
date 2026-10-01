@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.17 - 2026-10-01
+
+- A reboot during the cleanup after a successful upload no longer reports "UPLOAD: INTERRUPTED". The archive is already committed at that point, so the status now reads "✓ UPLOAD: Finished (cleanup interrupted – will be redone on next run)", and the next upload runs prune/compact again.
+- A really interrupted upload now says that Borg resumes from its last checkpoint when it is started again.
+
 ## v1.8.16 - 2026-09-23
 
 - Fault tolerance after reboot, crash, or kill: the worker PID file now stores the boot ID and process start time, so a leftover or reused PID is no longer mistaken for a running job. This matters under `sudo`, where the status lives in `/root/.cache` and survives a reboot.

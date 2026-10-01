@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.16
+# BorgBase Backup Manager v1.8.17
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -47,7 +47,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.16"
+APP_VERSION="v1.8.17"
 
 STATUS_FIELD_WIDTH=49
 
@@ -220,9 +220,22 @@ reconcile_job_status() {
     local kind="JOB"
     [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
     [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+    rm -f "$START_FILE" 2>/dev/null || true
+    # The archive is already committed once the post-upload prune/compact
+    # runs - only the cleanup was cut short, and the next run redoes it.
+    if [[ "$s" == *"(nachher)"* || "$s" == *"(post)"* ]]; then
+        touch "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+        set_job_status "$(say "✓ UPLOAD: Abgeschlossen (Aufräumen unterbrochen – wird beim nächsten Lauf nachgeholt)" \
+                              "✓ UPLOAD: Finished (cleanup interrupted – will be redone on next run)")"
+        return 0
+    fi
+    if [[ "$kind" == "UPLOAD" ]]; then
+        set_job_status "$(say "✗ UPLOAD: UNTERBROCHEN (Neustart/Abbruch) – erneut starten, Borg setzt am letzten Checkpoint fort" \
+                              "✗ UPLOAD: INTERRUPTED (reboot/abort) – start again, Borg resumes from last checkpoint")"
+        return 0
+    fi
     set_job_status "$(say "✗ ${kind}: UNTERBROCHEN (Neustart/Abbruch) – bitte erneut starten" \
                           "✗ ${kind}: INTERRUPTED (reboot/abort) – please start again")"
-    rm -f "$START_FILE" 2>/dev/null || true
 }
 
 get_job_status() {
