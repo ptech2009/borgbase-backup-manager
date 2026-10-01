@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.19 - 2026-10-01
+
+- An "UPLOAD: INTERRUPTED" status is now checked against the log: if the last upload in the log reached "UPLOAD SUCCESSFUL", the backup is complete and only the cleanup afterwards was cut short. The status then reads "✓ UPLOAD: Finished (only cleanup interrupted)" and the **What now?** box says there is nothing to do.
+- This also corrects statuses written by versions before v1.8.18 (for example after updating while an upload was running), which v1.8.18 showed without any hint.
+- An interrupted upload without a remembered file now also gets a **What now?** hint: choose 1 to start it again.
+
 ## v1.8.18 - 2026-10-01
 
 - Beginner-friendly recovery after a reboot, crash, or failed upload: the menu shows a **What now?** box under the status lines that says in plain words what happened and which option to choose.

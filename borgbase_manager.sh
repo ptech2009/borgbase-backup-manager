@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.18
+# BorgBase Backup Manager v1.8.19
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -49,7 +49,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.18"
+APP_VERSION="v1.8.19"
 
 STATUS_FIELD_WIDTH=49
 
@@ -224,9 +224,7 @@ interrupted_job_status() {
     [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
     [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
     if [[ "$s" == *"(nachher)"* || "$s" == *"(post)"* ]]; then
-        touch "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
-        say "✓ UPLOAD: Abgeschlossen (nur Aufräumen unterbrochen)" \
-            "✓ UPLOAD: Finished (only cleanup interrupted)"
+        upload_done_cleanup_cut_status
     elif [[ "$kind" == "UPLOAD" ]]; then
         say "✗ UPLOAD: UNTERBROCHEN (${why_de}) – mit 1 fortsetzen" \
             "✗ UPLOAD: INTERRUPTED (${why_en}) – resume with 1"
@@ -236,15 +234,40 @@ interrupted_job_status() {
     fi
 }
 
+upload_done_cleanup_cut_status() {
+    touch "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+    say "✓ UPLOAD: Abgeschlossen (nur Aufräumen unterbrochen)" \
+        "✓ UPLOAD: Finished (only cleanup interrupted)"
+}
+
+# Did the most recent upload in the log reach "UPLOAD SUCCESSFUL"? Reads the
+# log backwards and stops at the last start line; unknown counts as no.
+log_last_upload_succeeded() {
+    [[ -r "$LOG_FILE" ]] || return 1
+    tac -- "$LOG_FILE" 2>/dev/null | awk '
+        /UPLOAD (ERFOLGREICH|SUCCESSFUL)/ { ok = 1 }
+        /^(UPLOAD GESTARTET|UPLOAD STARTED):/ { found = 1; exit }
+        END { exit !(found && ok) }'
+}
+
 # If the status says "running" but no worker is alive (reboot, crash, kill -9,
 # power loss), replace it with a clear "interrupted" status instead of lying.
 reconcile_job_status() {
     [[ -s "$JOB_STATUS_FILE" ]] || return 0
     local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
-    job_status_is_active "$s" || return 0
     is_running && return 0
-    rm -f "$START_FILE" 2>/dev/null || true
-    set_job_status "$(interrupted_job_status "$s" "Neustart/Abbruch" "reboot/abort")"
+    if job_status_is_active "$s"; then
+        rm -f "$START_FILE" 2>/dev/null || true
+        s="$(interrupted_job_status "$s" "Neustart/Abbruch" "reboot/abort")"
+        set_job_status "$s"
+    fi
+    # An "interrupted" upload whose log ends with success only lost its
+    # cleanup. This also fixes statuses written by versions before v1.8.18,
+    # which kept no unfinished-upload marker.
+    if [[ "$s" == "✗ UPLOAD: "* && ( "$s" == *"UNTERBROCHEN"* || "$s" == *"INTERRUPTED"* ) ]] \
+            && [[ ! -f "$UPLOAD_MARKER_FILE" ]] && log_last_upload_succeeded; then
+        set_job_status "$(upload_done_cleanup_cut_status)"
+    fi
 }
 
 # -------------------- Unfinished upload marker --------------------
@@ -2008,6 +2031,11 @@ show_next_step_hint() {
         lines+=("$(say '  Nur das Aufräumen danach (alte Archive löschen,' '  Only the cleanup afterwards (deleting old archives,')")
         lines+=("$(say '  Platz freigeben) wurde unterbrochen. Das holt der' '  freeing space) was interrupted. The next upload')")
         lines+=("$(say '  nächste Upload automatisch nach – nichts zu tun.' '  redoes it automatically – nothing to do.')")
+    elif [[ "$job" == *"UPLOAD"* && ( "$job" == *"UNTERBROCHEN"* || "$job" == *"INTERRUPTED"* ) ]]; then
+        lines+=("$(say '⚠ Der letzte Upload wurde nicht fertig.' '⚠ The last upload did not finish.')")
+        lines+=("$(say '→ Wähle 1, um ihn erneut zu starten. Bereits hochgeladene' '→ Choose 1 to start it again. Parts already uploaded')")
+        lines+=("$(say '  Teile werden nicht noch einmal übertragen.' '  are not transferred again.')")
+        lines+=("$(say '  Nicht erneut starten, nur Hinweis entfernen: 7' '  Do not start again, just remove this hint: 7')")
     elif [[ "$job" == *"FEHLER"* || "$job" == *"ERROR"* ]]; then
         lines+=("$(say '✗ Der letzte Job ist mit einem Fehler beendet worden.' '✗ The last job ended with an error.')")
         lines+=("$(say '→ Details: 5 (Log). Verbindung prüfen: 4.' '→ Details: 5 (log). Check connection: 4.')")
