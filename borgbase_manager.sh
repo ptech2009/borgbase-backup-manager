@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.17
+# BorgBase Backup Manager v1.8.18
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -11,6 +11,8 @@
 #          e.g. /mnt/Panzerbackup-OAI - not just /media/* and /run/media/*
 # - FAULT TOLERANT: Detects jobs interrupted by reboot/crash/kill (PID + boot_id
 #        + start time) instead of showing a stale "running" status forever
+# - RESUME: Remembers an unfinished upload across reboots; the menu explains
+#        what to do and option 1 resumes it with the same file
 # - PZB: Recognizes the single-file .pzb container of Panzerbackup 3.x
 #        (Proxmox disaster recovery) in addition to the RAW *.img.zst images
 # - INTERACTIVE PRUNE: Shows archives before deletion for safety
@@ -47,7 +49,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.17"
+APP_VERSION="v1.8.18"
 
 STATUS_FIELD_WIDTH=49
 
@@ -101,6 +103,10 @@ CONN_STATUS_FILE="${RUNTIME_DIR}/borgbase-conn-status"
 PID_FILE="${RUNTIME_DIR}/borgbase-worker.pid"
 START_FILE="${RUNTIME_DIR}/borgbase-worker.start"
 PRUNE_NEEDED_FLAG="${RUNTIME_DIR}/borgbase-prune-needed"
+# Lives in the persistent state dir: $XDG_RUNTIME_DIR is wiped on reboot, but
+# an unfinished upload must still be known afterwards.
+UPLOAD_MARKER_FILE="${DEFAULT_STATE_DIR}/upload-in-progress"
+UPLOAD_IMAGE=""
 
 # -------------------- Defaults --------------------
 UI_LANG="${UI_LANG:-}"
@@ -210,6 +216,26 @@ job_status_is_active() {
     [[ "$s" == UPLOAD* || "$s" == DOWNLOAD* || "$s" == JOB* || "$s" == Job* ]]
 }
 
+# The status that replaces an active one when its worker is gone. Once the
+# post-upload prune/compact runs, the archive is already committed - only the
+# cleanup was cut short, and the next upload redoes it.
+interrupted_job_status() {
+    local s="$1" why_de="$2" why_en="$3" kind="JOB"
+    [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
+    [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+    if [[ "$s" == *"(nachher)"* || "$s" == *"(post)"* ]]; then
+        touch "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+        say "✓ UPLOAD: Abgeschlossen (nur Aufräumen unterbrochen)" \
+            "✓ UPLOAD: Finished (only cleanup interrupted)"
+    elif [[ "$kind" == "UPLOAD" ]]; then
+        say "✗ UPLOAD: UNTERBROCHEN (${why_de}) – mit 1 fortsetzen" \
+            "✗ UPLOAD: INTERRUPTED (${why_en}) – resume with 1"
+    else
+        say "✗ ${kind}: UNTERBROCHEN (${why_de}) – bitte erneut starten" \
+            "✗ ${kind}: INTERRUPTED (${why_en}) – please start again"
+    fi
+}
+
 # If the status says "running" but no worker is alive (reboot, crash, kill -9,
 # power loss), replace it with a clear "interrupted" status instead of lying.
 reconcile_job_status() {
@@ -217,25 +243,25 @@ reconcile_job_status() {
     local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
     job_status_is_active "$s" || return 0
     is_running && return 0
-    local kind="JOB"
-    [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
-    [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
     rm -f "$START_FILE" 2>/dev/null || true
-    # The archive is already committed once the post-upload prune/compact
-    # runs - only the cleanup was cut short, and the next run redoes it.
-    if [[ "$s" == *"(nachher)"* || "$s" == *"(post)"* ]]; then
-        touch "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
-        set_job_status "$(say "✓ UPLOAD: Abgeschlossen (Aufräumen unterbrochen – wird beim nächsten Lauf nachgeholt)" \
-                              "✓ UPLOAD: Finished (cleanup interrupted – will be redone on next run)")"
-        return 0
-    fi
-    if [[ "$kind" == "UPLOAD" ]]; then
-        set_job_status "$(say "✗ UPLOAD: UNTERBROCHEN (Neustart/Abbruch) – erneut starten, Borg setzt am letzten Checkpoint fort" \
-                              "✗ UPLOAD: INTERRUPTED (reboot/abort) – start again, Borg resumes from last checkpoint")"
-        return 0
-    fi
-    set_job_status "$(say "✗ ${kind}: UNTERBROCHEN (Neustart/Abbruch) – bitte erneut starten" \
-                          "✗ ${kind}: INTERRUPTED (reboot/abort) – please start again")"
+    set_job_status "$(interrupted_job_status "$s" "Neustart/Abbruch" "reboot/abort")"
+}
+
+# -------------------- Unfinished upload marker --------------------
+# Written when borg create starts, removed once it succeeded. If it exists
+# while no worker runs, the last upload did not finish (reboot, crash, error).
+upload_marker_write() {
+    atomic_write "$UPLOAD_MARKER_FILE" "$(printf 'started=%s\nsrc_dir=%s\nimage=%s\narchive=%s' \
+        "$(date +%s)" "$1" "$2" "$3")"
+}
+upload_marker_get() { sed -n "s/^$1=//p" "$UPLOAD_MARKER_FILE" 2>/dev/null | head -n1; }
+upload_marker_clear() { rm -f "$UPLOAD_MARKER_FILE" 2>/dev/null || true; }
+upload_unfinished() { [[ -f "$UPLOAD_MARKER_FILE" ]] && ! is_running; }
+
+# Image of the unfinished upload, if it is still there to be resumed.
+upload_marker_image() {
+    local img; img="$(upload_marker_get image)"
+    [[ -n "$img" && -f "$img" ]] && echo "$img"
 }
 
 get_job_status() {
@@ -358,6 +384,7 @@ clear_status() {
         return 1
     fi
     rm -f "$JOB_STATUS_FILE" "$CONN_STATUS_FILE" "$START_FILE" "$PID_FILE" "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+    upload_marker_clear
 }
 
 # Worker bookkeeping: register this process, and on any exit (error, SIGTERM,
@@ -379,10 +406,7 @@ worker_on_exit() {
     fi
     local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
     if job_status_is_active "$s"; then
-        local kind="JOB"
-        [[ "$s" == UPLOAD* ]] && kind="UPLOAD"
-        [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
-        set_job_status "$(say "✗ ${kind}: UNTERBROCHEN (rc=${rc}) – siehe Log" "✗ ${kind}: INTERRUPTED (rc=${rc}) – see log")"
+        set_job_status "$(interrupted_job_status "$s" "rc=${rc}" "rc=${rc}")"
         echo "$(say "Worker beendet (rc=${rc}), Job war noch aktiv: $(date)" "Worker exited (rc=${rc}) while job was active: $(date)")" >> "$LOG_FILE" 2>/dev/null || true
     fi
 }
@@ -1268,7 +1292,11 @@ do_upload_background() {
     fi
 
     echo -e "${G}$(say 'Starte Upload im Hintergrund (detached)...' 'Starting upload in background (detached)...')${NC}"
-    start_detached_worker upload --src-dir "$SRC_DIR"
+    if [[ -n "$UPLOAD_IMAGE" ]]; then
+        start_detached_worker upload --src-dir "$SRC_DIR" --image "$UPLOAD_IMAGE"
+    else
+        start_detached_worker upload --src-dir "$SRC_DIR"
+    fi
 }
 
 # -------------------- Detached worker launcher --------------------
@@ -1278,7 +1306,9 @@ start_detached_worker() {
 
     ensure_logfile_writable
 
-    nohup setsid "$0" --worker "$mode" "$@" </dev/null >/dev/null 2>&1 &
+    # Run through bash explicitly: the script may lack the executable bit
+    # (started as "bash borgbase_manager.sh").
+    nohup setsid "$BASH" "$0" --worker "$mode" "$@" </dev/null >/dev/null 2>&1 &
     local pid=$!
 
     write_pid_record "$pid"
@@ -1289,6 +1319,9 @@ start_detached_worker() {
 # -------------------- Worker: Upload (foreground implementation) --------------------
 worker_upload() {
     local src_dir="${1:-$SRC_DIR}"
+    if [[ -n "$UPLOAD_IMAGE" && -f "$UPLOAD_IMAGE" ]]; then
+        src_dir="$(dirname -- "$UPLOAD_IMAGE")"
+    fi
 
     ensure_logfile_writable
     worker_register
@@ -1367,13 +1400,22 @@ worker_upload() {
 
     if [[ "$is_panzer" == "yes" ]]; then
         local latest_img base img sha sfd
-        latest_img="$(panzer_newest_image "$src_dir" || true)"
+        if [[ -n "$UPLOAD_IMAGE" && -f "$UPLOAD_IMAGE" ]]; then
+            latest_img="$UPLOAD_IMAGE"
+        else
+            latest_img="$(panzer_newest_image "$src_dir" || true)"
+        fi
         if [[ -z "$latest_img" ]]; then
             set_job_status "$(say 'UPLOAD: FEHLER – Kein Panzerbackup-Image (*.img.zst[.gpg] / *.pzb) gefunden' 'UPLOAD: ERROR – No Panzerbackup image (*.img.zst[.gpg] / *.pzb) found')"
             echo -e "${R}$(say '✗ FEHLER: Kein Panzerbackup-Image (*.img.zst[.gpg] / *.pzb) gefunden' '✗ ERROR: No Panzerbackup image (*.img.zst[.gpg] / *.pzb) found')${NC}" | tee -a "$LOG_FILE"
             return 1
         fi
         img="$latest_img"
+        if [[ "$(upload_marker_image)" == "$img" ]]; then
+            echo "$(say 'Setze unterbrochenen Upload fort: Borg liest die Datei lokal komplett ein und überträgt nur, was noch fehlt.' \
+                        'Resuming interrupted upload: Borg reads the file locally in full and only transfers what is still missing.')" | tee -a "$LOG_FILE"
+        fi
+        upload_marker_write "$src_dir" "$img" "$archive_name"
         if [[ "$img" == *.pzb ]]; then
             base="${img%.pzb}"
         elif [[ "$img" == *.img.zst.gpg ]]; then
@@ -1439,6 +1481,7 @@ worker_upload() {
         rm -f "$include_file" 2>/dev/null || true
 
     else
+        upload_marker_write "$src_dir" "" "$archive_name"
         local create_out _attempt _max
         _attempt=0
         _max=$(( UPLOAD_MAX_RETRIES + 1 ))
@@ -1479,6 +1522,7 @@ worker_upload() {
         echo "$(say '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛' '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛')" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
         set_job_status "$(say '✓ UPLOAD: Abgeschlossen' '✓ UPLOAD: Finished')"
+        upload_marker_clear
 
         if [[ "${PRUNE_AFTER_CREATE:-yes}" == "yes" && "${PRUNE:-yes}" == "yes" ]]; then
             set_job_status "$(say 'UPLOAD: Prune/Compact (nachher)...' 'UPLOAD: Prune/Compact (post)...')"
@@ -1787,7 +1831,7 @@ maybe_inhibit_exec() {
     export _INHIBITED=1
     local inhibit_what
     inhibit_what="$(supported_inhibit_what "${INHIBIT_WHAT}" "${INHIBIT_FALLBACK_WHAT}")"
-    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY}" "$0" "$@"
+    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY}" "$BASH" "$0" "$@"
 }
 
 maybe_inhibit_reexec_worker() {
@@ -1800,7 +1844,7 @@ maybe_inhibit_reexec_worker() {
     local inhibit_what
     inhibit_what="$(supported_inhibit_what "${INHIBIT_WHAT}" "${INHIBIT_FALLBACK_WHAT}")"
     echo "$(say 'Aktiviere Schutz gegen Energiesparmodus:' 'Enabling sleep/idle inhibition:') ${inhibit_what}" >> "$LOG_FILE" 2>/dev/null || true
-    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} (${mode})" "$0" --worker "$mode" "$@"
+    exec systemd-inhibit --what="${inhibit_what}" --mode="${INHIBIT_MODE}" --why="${INHIBIT_WHY} (${mode})" "$BASH" "$0" --worker "$mode" "$@"
 }
 
 # -------------------- systemd user units --------------------
@@ -1823,7 +1867,7 @@ After=network-online.target
 Type=oneshot
 EnvironmentFile=-${CONFIG_DIR}/borgbase-manager.env
 Environment=INHIBIT_SLEEP=yes
-ExecStart=${script_path} upload
+ExecStart=/usr/bin/env bash ${script_path} upload
 EOF
 
     cat > "$timer_file" <<EOF
@@ -1929,6 +1973,57 @@ live_progress_view() {
 }
 
 # -------------------- Menu --------------------
+# Plain-language "what now?" box under the status lines, so nobody has to
+# interpret a status after a reboot, crash or failed upload.
+show_next_step_hint() {
+    local job; job="$(get_job_status)"
+    local lines=()
+    if is_running; then
+        if [[ "$job" == UPLOAD* ]]; then
+            lines+=("$(say '⏳ Upload läuft im Hintergrund.' '⏳ Upload is running in the background.')")
+            lines+=("$(say '   Den PC möglichst nicht neu starten oder ausschalten.' '   Avoid rebooting or shutting down the PC.')")
+            lines+=("$(say '   Falls doch: kein Problem – danach mit 1 fortsetzen.' '   If you must: no problem – resume with 1 afterwards.')")
+            lines+=("$(say '   Fortschritt ansehen: 9' '   Watch progress: 9')")
+        fi
+    elif upload_unfinished; then
+        local started img started_txt
+        started="$(upload_marker_get started)"
+        img="$(upload_marker_get image)"
+        started_txt="$(date -d "@${started:-0}" '+%d.%m.%Y %H:%M' 2>/dev/null || echo '?')"
+        lines+=("$(say "⚠ Der letzte Upload wurde nicht fertig (gestartet ${started_txt})." "⚠ The last upload did not finish (started ${started_txt}).")")
+        [[ -n "$img" ]] && lines+=("$(say "   Datei: $(basename -- "$img")" "   File: $(basename -- "$img")")")
+        if [[ -n "$img" && ! -f "$img" ]]; then
+            lines+=("$(say '→ Die Datei ist gerade nicht erreichbar: Backup-Platte' '→ The file is not reachable right now: connect and')")
+            lines+=("$(say '  anschließen bzw. einhängen, dann 1 wählen.' '  mount the backup disk, then choose 1.')")
+        else
+            lines+=("$(say '→ Wähle 1, um ihn fortzusetzen. Bereits hochgeladene' '→ Choose 1 to resume it. Parts already uploaded')")
+            lines+=("$(say '  Teile werden nicht noch einmal übertragen.' '  are not transferred again.')")
+        fi
+        if [[ "$job" == *"FEHLER"* || "$job" == *"ERROR"* ]]; then
+            lines+=("$(say '  Ursache des Abbruchs steht im Log: 5' '  The cause is in the log: 5')")
+        fi
+        lines+=("$(say '  Nicht fortsetzen, nur Hinweis entfernen: 7' '  Do not resume, just remove this hint: 7')")
+    elif [[ "$job" == *"Aufräumen unterbrochen"* || "$job" == *"cleanup interrupted"* ]]; then
+        lines+=("$(say '✓ Dein Backup ist vollständig gesichert.' '✓ Your backup is completely stored.')")
+        lines+=("$(say '  Nur das Aufräumen danach (alte Archive löschen,' '  Only the cleanup afterwards (deleting old archives,')")
+        lines+=("$(say '  Platz freigeben) wurde unterbrochen. Das holt der' '  freeing space) was interrupted. The next upload')")
+        lines+=("$(say '  nächste Upload automatisch nach – nichts zu tun.' '  redoes it automatically – nothing to do.')")
+    elif [[ "$job" == *"FEHLER"* || "$job" == *"ERROR"* ]]; then
+        lines+=("$(say '✗ Der letzte Job ist mit einem Fehler beendet worden.' '✗ The last job ended with an error.')")
+        lines+=("$(say '→ Details: 5 (Log). Verbindung prüfen: 4.' '→ Details: 5 (log). Check connection: 4.')")
+    elif [[ "$job" == *"DOWNLOAD"*"UNTERBROCHEN"* || "$job" == *"DOWNLOAD"*"INTERRUPTED"* ]]; then
+        lines+=("$(say '⚠ Der Download wurde unterbrochen.' '⚠ The download was interrupted.')")
+        lines+=("$(say '→ Mit 2 einfach neu starten.' '→ Simply start it again with 2.')")
+    fi
+    (( ${#lines[@]} )) || return 0
+    echo -e "  ${BOLD}$(say 'Was ist zu tun?' 'What now?')${NC}"
+    local l
+    for l in "${lines[@]}"; do
+        echo -e "  ${l}"
+    done
+    echo ""
+}
+
 show_menu() {
     clear 2>/dev/null || true
     echo -e "${B}${BOLD}============================================================${NC}"
@@ -1940,7 +2035,12 @@ show_menu() {
     echo -e "  $(say 'Job:  ' 'Job:  ') ${job_line}"
     echo -e "  $(say 'Repo: ' 'Repo: ') ${conn_line}"
     echo ""
-    echo -e "${C}1)  $(say 'Backup zu BorgBase hochladen' 'Upload backup to BorgBase')${NC}"
+    show_next_step_hint
+    if upload_unfinished; then
+        echo -e "${C}1)  $(say 'Unterbrochenen Upload fortsetzen' 'Resume interrupted upload')${NC}"
+    else
+        echo -e "${C}1)  $(say 'Backup zu BorgBase hochladen' 'Upload backup to BorgBase')${NC}"
+    fi
     echo -e "${C}2)  $(say 'Backup von BorgBase herunterladen' 'Download backup from BorgBase')${NC}"
     echo -e "${C}3)  $(say 'Alle Archive auflisten' 'List all archives')${NC}"
     echo -e "${C}4)  $(say 'Verbindung zum Repo testen' 'Test repo connection')${NC}"
@@ -1976,6 +2076,7 @@ if [[ "${1:-}" == "--worker" ]]; then
             --src-dir)   worker_src_dir="${2:-}"; shift 2 || true ;;
             --archive)   worker_archive="${2:-}"; shift 2 || true ;;
             --dest-dir)  worker_dest_dir="${2:-}"; shift 2 || true ;;
+            --image)     UPLOAD_IMAGE="${2:-}"; shift 2 || true ;;
             *) shift || true ;;
         esac
     done
@@ -2106,8 +2207,29 @@ while true; do
                 
                 echo ""
 
+                UPLOAD_IMAGE=""
                 if is_panzerbackup_source "$SRC_DIR"; then
                     latest_img_preview="$(panzer_newest_image "$SRC_DIR" || true)"
+                    resume_img="$(upload_marker_image || true)"
+                    if [[ -n "$resume_img" ]]; then
+                        if [[ -n "$latest_img_preview" && "$latest_img_preview" != "$resume_img" ]]; then
+                            echo -e "${Y}$(say 'Der unterbrochene Upload betraf eine ältere Datei. Inzwischen gibt es eine neuere:' 'The interrupted upload was for an older file. A newer one exists now:')${NC}"
+                            echo "  1) $(say 'Unterbrochenen Upload fortsetzen (schneller):' 'Resume interrupted upload (faster):') $(basename -- "$resume_img")"
+                            echo "  2) $(say 'Neuere Datei hochladen (beginnt von vorn):' 'Upload newer file (starts over):') $(basename -- "$latest_img_preview")"
+                            read -r -p "$(say 'Auswahl (1/2) [1]: ' 'Choice (1/2) [1]: ')" resume_choice
+                            if [[ "$resume_choice" == "2" ]]; then
+                                resume_img=""
+                            fi
+                        fi
+                    fi
+                    if [[ -n "$resume_img" ]]; then
+                        UPLOAD_IMAGE="$resume_img"
+                        latest_img_preview="$resume_img"
+                        echo -e "${G}$(say '↻ Der unterbrochene Upload wird fortgesetzt.' '↻ The interrupted upload will be resumed.')${NC}"
+                        echo "$(say '  Borg liest die Datei zuerst lokal komplett ein (bei großen Images dauert' '  Borg first reads the whole file locally (for large images this takes')"
+                        echo "$(say '  das eine Weile) und überträgt dann nur, was noch fehlt.' '  a while) and then only transfers what is still missing.')"
+                        echo ""
+                    fi
                     if [[ -n "$latest_img_preview" ]]; then
                         echo -e "${C}$(say 'Lokale Datei für Upload:' 'Local file for upload:')${NC} $(basename -- "$latest_img_preview")"
                     else

@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.17-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.18-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -132,7 +132,7 @@ Run the script without arguments to access the interactive menu:
 ```
 
 **Menu Options:**
-1. **Upload** - Upload Panzerbackup with smart prune preview
+1. **Upload** - Upload Panzerbackup with smart prune preview (shown as **Resume interrupted upload** after an unfinished upload)
 2. **Download** - Select and download an archive
 3. **List Archives** - Show all backups in repository
 4. **Test Connection** - Verify repository access
@@ -158,6 +158,8 @@ When you select **Upload** from the menu:
      - **Skip**: Continue without pruning
 3. **Upload Confirmation**: Final prompt before starting
 4. **Background Execution**: Upload runs in background with live progress
+
+The menu shows a **What now?** box under the status lines whenever there is something to do or to know, for example after a reboot during an upload.
 
 ### Retention Policies
 
@@ -267,6 +269,18 @@ WORKER END: upload @ 2024-01-15 10:45:30
 
 ## 🔧 Troubleshooting
 
+### PC Rebooted or Shut Down During an Upload
+Nothing is lost, and you do not have to start from zero. Borg saves a checkpoint in the repository every 5 minutes (`BORG_CHECKPOINT_INTERVAL=300`).
+
+1. Start the script again. The **What now?** box tells you what happened.
+2. If it says **"The last upload did not finish"**, choose **1** (now labeled **Resume interrupted upload**). The script uploads the same file again. Borg reads it locally in full (this takes a while for large images), but only transfers what is not in the repository yet.
+3. If it says the file is not reachable, connect and mount the backup disk first, then choose **1**.
+4. If a newer Panzerbackup image appeared in the meantime, the script asks whether to resume the old upload (faster) or upload the newer file (starts over).
+
+If the box says **"Your backup is completely stored"**, the upload had already finished, and the reboot only interrupted the cleanup afterwards (pruning old archives, compacting). There is nothing to do: the next upload redoes the cleanup.
+
+Do not want to resume? Choose **7** to remove the hint.
+
 ### Repository Locked
 If you see "Repository locked" warnings:
 1. Check if another process is using the repository
@@ -280,7 +294,7 @@ If you see "Repository locked" warnings:
 4. Re-run wizard to reconfigure: Menu option **8**
 
 ### Broken Pipe During Large Uploads
-If the log shows `client_loop: send disconnect: Broken pipe` or `Connection closed by remote host`, the SSH session was closed during or near the end of the upload. Restart the upload; Borg reuses existing chunks/checkpoints and should not resend everything.
+If the log shows `client_loop: send disconnect: Broken pipe` or `Connection closed by remote host`, the SSH session was closed during or near the end of the upload. Resume it with menu option **1**; Borg reuses existing chunks/checkpoints and does not resend everything.
 
 The default SSH keepalive settings are tuned for long desktop uploads. On Linux desktops, `systemd-inhibit` also blocks automatic sleep/idle and lid-switch suspend while the upload worker is running.
 

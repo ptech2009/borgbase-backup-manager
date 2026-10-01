@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.18 - 2026-10-01
+
+- Beginner-friendly recovery after a reboot, crash, or failed upload: the menu shows a **What now?** box under the status lines that says in plain words what happened and which option to choose.
+- An unfinished upload is remembered in the persistent state directory, so it is still known after a reboot (the status in `$XDG_RUNTIME_DIR` is wiped on reboot). Option 1 then reads **Resume interrupted upload** and uploads the same file again; Borg only transfers what is not in the repository yet.
+- If a newer Panzerbackup image appeared in the meantime, option 1 asks whether to resume the old upload (faster) or upload the newer file (starts over). If the file is not reachable, the box asks to connect and mount the backup disk first.
+- A reboot during the cleanup after a successful upload says "Your backup is completely stored – nothing to do", also when the worker was stopped by SIGTERM during shutdown.
+- Fixed: starting the script with `bash borgbase_manager.sh` without the executable bit started no background job ("Permission denied"). The script now re-runs itself through bash, and the systemd service does the same. The repository now stores the script as executable.
+- Option 7 (Clear status) also removes the unfinished-upload hint.
+- README: new troubleshooting section "PC Rebooted or Shut Down During an Upload".
+
 ## v1.8.17 - 2026-10-01
 
 - A reboot during the cleanup after a successful upload no longer reports "UPLOAD: INTERRUPTED". The archive is already committed at that point, so the status now reads "✓ UPLOAD: Finished (cleanup interrupted – will be redone on next run)", and the next upload runs prune/compact again.
