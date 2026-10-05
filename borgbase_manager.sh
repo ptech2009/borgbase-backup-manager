@@ -49,7 +49,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.19"
+APP_VERSION="v1.8.20"
 
 STATUS_FIELD_WIDTH=49
 
@@ -103,6 +103,9 @@ CONN_STATUS_FILE="${RUNTIME_DIR}/borgbase-conn-status"
 PID_FILE="${RUNTIME_DIR}/borgbase-worker.pid"
 START_FILE="${RUNTIME_DIR}/borgbase-worker.start"
 PRUNE_NEEDED_FLAG="${RUNTIME_DIR}/borgbase-prune-needed"
+# Written by "stop" (menu s / CLI) or the lock watchdog; the worker reads the
+# reason from it and ends with "stopped" instead of "error"/"interrupted".
+STOP_REQUEST_FILE="${RUNTIME_DIR}/borgbase-stop-request"
 # Lives in the persistent state dir: $XDG_RUNTIME_DIR is wiped on reboot, but
 # an unfinished upload must still be known afterwards.
 UPLOAD_MARKER_FILE="${DEFAULT_STATE_DIR}/upload-in-progress"
@@ -144,6 +147,11 @@ PRUNE_BEFORE_CREATE="${PRUNE_BEFORE_CREATE:-yes}"             # unattended clean
 AUTO_RETRY_ON_SSH_DISCONNECT="${AUTO_RETRY_ON_SSH_DISCONNECT:-yes}"  # auto-retry on Broken Pipe
 UPLOAD_MAX_RETRIES="${UPLOAD_MAX_RETRIES:-5}"                 # max retry attempts on SSH disconnect
 UPLOAD_RETRY_DELAY="${UPLOAD_RETRY_DELAY:-30}"                # seconds to wait before each retry
+# Borg 1.x notices a broken repo lock only at the very end. Another client on
+# this PC (e.g. Vorta) running "borg break-lock" lets it write into the repo at
+# the same time as our job - the watchdog stops our job as soon as it sees that.
+LOCK_WATCHDOG="${LOCK_WATCHDOG:-yes}"
+STOP_GRACE_SECONDS="${STOP_GRACE_SECONDS:-60}"                # wait for borg's checkpoint before killing
 
 # Desktop-Schonung: Borg mit niedriger CPU-/IO-Priorität ausführen, damit der
 # Rechner während des Uploads bedienbar bleibt (kein ruckelnder Mauszeiger).
@@ -406,13 +414,14 @@ clear_status() {
     if is_running; then
         return 1
     fi
-    rm -f "$JOB_STATUS_FILE" "$CONN_STATUS_FILE" "$START_FILE" "$PID_FILE" "$PRUNE_NEEDED_FLAG" 2>/dev/null || true
+    rm -f "$JOB_STATUS_FILE" "$CONN_STATUS_FILE" "$START_FILE" "$PID_FILE" "$PRUNE_NEEDED_FLAG" "$STOP_REQUEST_FILE" 2>/dev/null || true
     upload_marker_clear
 }
 
 # Worker bookkeeping: register this process, and on any exit (error, SIGTERM,
 # SIGHUP, Ctrl+C) remove our PID file and never leave a "running" status behind.
 worker_register() {
+    rm -f "$STOP_REQUEST_FILE" 2>/dev/null || true
     write_pid_record "$$"
     date +%s > "$START_FILE" 2>/dev/null || true
     trap worker_on_exit EXIT
@@ -423,15 +432,188 @@ worker_register() {
 
 worker_on_exit() {
     local rc=$?
+    if [[ -n "${LOCK_WATCHDOG_PID:-}" ]]; then kill "$LOCK_WATCHDOG_PID" 2>/dev/null || true; fi
     local pid; pid="$(read_pid)"
     if [[ "$pid" == "$$" ]]; then
         rm -f "$PID_FILE" "$START_FILE" 2>/dev/null || true
     fi
     local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
-    if job_status_is_active "$s"; then
+    if job_status_is_active "$s" && stop_requested && [[ "$s" != *"(nachher)"* && "$s" != *"(post)"* ]]; then
+        local kind="UPLOAD"
+        [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+        set_job_status "$(stopped_job_status "$kind")"
+    elif job_status_is_active "$s"; then
         set_job_status "$(interrupted_job_status "$s" "rc=${rc}" "rc=${rc}")"
         echo "$(say "Worker beendet (rc=${rc}), Job war noch aktiv: $(date)" "Worker exited (rc=${rc}) while job was active: $(date)")" >> "$LOG_FILE" 2>/dev/null || true
     fi
+}
+
+# -------------------- Stopping a job --------------------
+# start_detached_worker runs the worker under setsid: borg, ssh and
+# systemd-inhibit share its session, and nothing outside of it does.
+worker_sid() { ps -o sid= -p "${1:?pid}" 2>/dev/null | tr -d ' ' || true; }
+
+stop_requested() { [[ -s "$STOP_REQUEST_FILE" ]]; }
+stop_reason() { local r; read -r r _ < "$STOP_REQUEST_FILE" 2>/dev/null || true; echo "${r:-}"; }
+
+# All running borg processes as "<pid> <sid> <subcommand> <args...>". Borg is
+# often a Python script ("/usr/bin/python3 /usr/bin/borg create ..."), so the
+# executable is looked up in the first argv words; a shell whose command line
+# merely mentions "borg break-lock" is not a borg process.
+borg_processes() {
+    ps -eo pid=,sid=,args= 2>/dev/null | awk '{
+        b = 0
+        for (i = 3; i <= 5 && i <= NF; i++) if ($i ~ /(^|\/)borg$/) { b = i; break }
+        if (!b) next
+        for (j = b + 1; j <= NF && $j ~ /^-/; j++) ;
+        if (j > NF) next
+        line = $0; sub(/^ *[0-9]+ +[0-9]+ +/, "", line)
+        print $1, $2, $j, line }'
+}
+
+# Signal only the borg processes of a worker session. SIGINT makes borg create
+# write a checkpoint and exit cleanly. SIGTERM ends it without committing - used
+# when another client holds the lock, so that we write nothing more.
+signal_session_borg() {
+    local sig="$1" sid="$2" p
+    [[ "$sid" =~ ^[0-9]+$ ]] || return 1
+    for p in $(borg_processes | awk -v s="$sid" '$2 == s { print $1 }'); do
+        kill -"$sig" "$p" 2>/dev/null || true
+    done
+}
+
+# reason: manual | lock_broken
+request_job_stop() {
+    local reason="$1" sid="$2" detail="${3:-}"
+    stop_requested || atomic_write "$STOP_REQUEST_FILE" "${reason} $(date +%s) ${detail}"
+    if [[ "$reason" == "lock_broken" ]]; then
+        signal_session_borg TERM "$sid"
+    else
+        signal_session_borg INT "$sid"
+    fi
+}
+
+stopped_job_status() {
+    local kind="$1" again_de="mit 1 fortsetzen" again_en="resume with 1"
+    if [[ "$kind" == "DOWNLOAD" ]]; then
+        again_de="mit 2 neu starten"; again_en="start again with 2"
+    fi
+    if [[ "$(stop_reason)" == "lock_broken" ]]; then
+        say "✗ ${kind}: ABGEBROCHEN – Repo-Lock von anderem Programm gebrochen – ${again_de}" \
+            "✗ ${kind}: ABORTED – repo lock broken by another program – ${again_en}"
+    else
+        say "✗ ${kind}: GESTOPPT (manuell) – ${again_de}" \
+            "✗ ${kind}: STOPPED (manually) – ${again_en}"
+    fi
+}
+
+# Worker side: log and set the final status once borg has exited after a stop.
+finish_stopped_job() {
+    local kind="$1"
+    echo "" | tee -a "$LOG_FILE"
+    if [[ "$(stop_reason)" == "lock_broken" ]]; then
+        echo "$(say "✗ ${kind} ABGEBROCHEN: Ein anderes Programm hat den Repo-Lock gebrochen ($(date))." \
+                    "✗ ${kind} ABORTED: another program broke the repo lock ($(date)).")" | tee -a "$LOG_FILE"
+        echo "$(say '  Vor dem nächsten Upload das Repo prüfen: borg check --repository-only' \
+                    '  Check the repo before the next upload: borg check --repository-only')" | tee -a "$LOG_FILE"
+    else
+        echo "$(say "■ ${kind} MANUELL GESTOPPT: $(date)" "■ ${kind} STOPPED MANUALLY: $(date)")" | tee -a "$LOG_FILE"
+    fi
+    set_job_status "$(stopped_job_status "$kind")"
+}
+
+# Wait between upload retries, but give up at once when a stop was requested.
+retry_wait() {
+    local i
+    for (( i = 0; i < $1; i++ )); do
+        stop_requested && return 1
+        sleep 1
+    done
+    ! stop_requested
+}
+
+# Borg 1.x notices a broken lock only when it releases it at the very end. Until
+# then another client - here: Vorta after "borg break-lock" - writes into the
+# repo at the same time. Watch for a break-lock on our repo from any other
+# session and stop our job at once. Only processes on this PC are visible.
+start_lock_watchdog() {
+    [[ "${LOCK_WATCHDOG:-yes}" == "yes" ]] || return 0
+    local me=$$ sid authority
+    sid="$(worker_sid "$$")"
+    authority="$(_repo_authority "$REPO")"
+    authority="${authority%%:*}"
+    [[ "$sid" =~ ^[0-9]+$ && -n "$authority" ]] || return 0
+    (
+        trap - EXIT HUP INT TERM
+        while kill -0 "$me" 2>/dev/null; do
+            hit="$(borg_processes | awk -v s="$sid" -v a="$authority" '
+                $2 != s && $3 == "break-lock" && index($0, a) { $2 = ""; $3 = ""; print substr($0, 1, 200); exit }')" || true
+            if [[ -n "$hit" ]]; then
+                {
+                    echo ""
+                    echo "$(say "⚠ Fremdes 'borg break-lock' auf dieses Repo erkannt (PID ${hit})" \
+                                "⚠ Foreign 'borg break-lock' on this repo detected (PID ${hit})")"
+                    echo "$(say '  Unser Repo-Lock ist damit weg. Job wird sofort beendet, damit nicht zwei Programme gleichzeitig ins Repo schreiben.' \
+                                '  Our repo lock is gone. Stopping the job now so that two programs do not write into the repo at once.')"
+                } >> "$LOG_FILE" 2>/dev/null
+                request_job_stop lock_broken "$sid" "$hit"
+                exit 0
+            fi
+            sleep 1
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    LOCK_WATCHDOG_PID=$!
+}
+
+# Menu/CLI side: stop the running job. Borg gets SIGINT first and writes a
+# checkpoint; only if the worker is still alive after STOP_GRACE_SECONDS the
+# whole session is terminated.
+stop_running_job() {
+    if ! is_running; then
+        echo -e "${Y}$(say 'Es läuft kein Job.' 'No job is running.')${NC}"
+        return 1
+    fi
+    local pid sid i
+    pid="$(read_pid)"
+    sid="$(worker_sid "$pid")"
+    if [[ ! "$sid" =~ ^[0-9]+$ ]]; then
+        echo -e "${R}$(say "✗ Prozess ${pid} nicht gefunden." "✗ Process ${pid} not found.")${NC}"
+        return 1
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo -e "${R}$(say "✗ Keine Berechtigung, Job ${pid} zu stoppen (mit sudo gestartet? Dann auch mit sudo stoppen)." \
+                         "✗ Not allowed to stop job ${pid} (started with sudo? Then stop it with sudo too).")${NC}"
+        return 1
+    fi
+    request_job_stop manual "$sid"
+    echo "$(say 'Stoppe Job – Borg schreibt noch einen Checkpoint, das kann bis zu einer Minute dauern...' \
+                'Stopping job – Borg writes a checkpoint first, this can take up to a minute...')"
+    for (( i = 0; i < STOP_GRACE_SECONDS; i++ )); do
+        is_running || break
+        sleep 1
+    done
+    if is_running; then
+        echo -e "${Y}$(say 'Job reagiert nicht – wird hart beendet.' 'Job does not respond – terminating it.')${NC}"
+        kill -TERM -- "-${sid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for (( i = 0; i < 10; i++ )); do
+            is_running || break
+            sleep 1
+        done
+        is_running && { kill -KILL -- "-${sid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; }
+        sleep 1
+    fi
+    if is_running; then
+        echo -e "${R}$(say '✗ Job läuft noch.' '✗ Job is still running.')${NC}"
+        return 1
+    fi
+    # After a hard kill no trap ran: the status still says "running".
+    local s; s="$(tail -n1 "$JOB_STATUS_FILE" 2>/dev/null || true)"
+    if job_status_is_active "$s"; then
+        local kind="UPLOAD"
+        [[ "$s" == DOWNLOAD* ]] && kind="DOWNLOAD"
+        set_job_status "$(stopped_job_status "$kind")"
+    fi
+    echo -e "$(say 'Status:' 'Status:') $(get_job_status_formatted)"
 }
 
 # -------------------- Log file --------------------
@@ -1365,6 +1547,7 @@ worker_upload() {
         echo -e "${R}$(say '✗ FEHLER: Borg-Setup fehlgeschlagen' '✗ ERROR: Borg setup failed')${NC}" | tee -a "$LOG_FILE"
         return 1
     fi
+    start_lock_watchdog
 
     if [[ -z "$src_dir" || ! -d "$src_dir" ]]; then
         if detect_src_dir >/dev/null 2>&1; then
@@ -1402,8 +1585,12 @@ worker_upload() {
         echo "$(say '└───────────────────────────────────────────────────────┘' '└───────────────────────────────────────────────────────┘')" | tee -a "$LOG_FILE"
 
         "${BORG_NICE[@]}" borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
-        "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+        stop_requested || "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
         echo "" | tee -a "$LOG_FILE"
+        if stop_requested; then
+            finish_stopped_job UPLOAD
+            return 130
+        fi
     fi
 
     if [[ "$is_panzer" == "yes" ]]; then
@@ -1477,7 +1664,7 @@ worker_upload() {
                 echo "" | tee -a "$LOG_FILE"
                 echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
                             "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
-                sleep "${UPLOAD_RETRY_DELAY}"
+                retry_wait "${UPLOAD_RETRY_DELAY}" || break
             fi
 
             create_out="$(mktemp)"
@@ -1496,6 +1683,7 @@ worker_upload() {
             fi
             rm -f "$create_out" 2>/dev/null || true
 
+            stop_requested && break
             [[ $rc -eq 0 ]] && break
             [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
             [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
@@ -1513,7 +1701,7 @@ worker_upload() {
                 echo "" | tee -a "$LOG_FILE"
                 echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
                             "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
-                sleep "${UPLOAD_RETRY_DELAY}"
+                retry_wait "${UPLOAD_RETRY_DELAY}" || break
             fi
 
             create_out="$(mktemp)"
@@ -1532,10 +1720,16 @@ worker_upload() {
             fi
             rm -f "$create_out" 2>/dev/null || true
 
+            stop_requested && break
             [[ $rc -eq 0 ]] && break
             [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
             [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
         done
+    fi
+
+    if [[ "$rc" -ne 0 ]] && stop_requested; then
+        finish_stopped_job UPLOAD
+        return 130
     fi
 
     if [[ "$rc" -eq 0 ]]; then
@@ -1550,7 +1744,12 @@ worker_upload() {
         if [[ "${PRUNE_AFTER_CREATE:-yes}" == "yes" && "${PRUNE:-yes}" == "yes" ]]; then
             set_job_status "$(say 'UPLOAD: Prune/Compact (nachher)...' 'UPLOAD: Prune/Compact (post)...')"
             "${BORG_NICE[@]}" borg prune --lock-wait "$BORG_LOCK_WAIT" --list --glob-archives "${prune_pattern}" --keep-last "${keep_setting}" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
-            "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+            stop_requested || "${BORG_NICE[@]}" borg compact --lock-wait "$BORG_LOCK_WAIT" "$REPO" 2>&1 | tee -a "$LOG_FILE" || true
+            if stop_requested; then
+                # The archive is committed; only the cleanup was cut short.
+                set_job_status "$(upload_done_cleanup_cut_status)"
+                return 0
+            fi
             set_job_status "$(say '✓ UPLOAD: Abgeschlossen' '✓ UPLOAD: Finished')"
         fi
 
@@ -1656,6 +1855,7 @@ worker_download() {
         echo -e "${R}$(say '✗ FEHLER: Borg-Setup fehlgeschlagen' '✗ ERROR: Borg setup failed')${NC}" | tee -a "$LOG_FILE"
         return 1
     fi
+    start_lock_watchdog
 
     mkdir -p "$dest_dir" 2>/dev/null || true
     if ! cd "$dest_dir" 2>/dev/null; then
@@ -1676,6 +1876,11 @@ worker_download() {
         rc=0
     else
         rc="${PIPESTATUS[0]:-1}"
+    fi
+
+    if [[ "$rc" -ne 0 ]] && stop_requested; then
+        finish_stopped_job DOWNLOAD
+        return 130
     fi
 
     if [[ "$rc" -eq 0 ]]; then
@@ -1965,7 +2170,7 @@ live_progress_view() {
             echo "  $(say "Log-Update vor: ${age}s" "Log updated: ${age}s ago")"
         fi
         echo "============================================================"
-        echo "$(say 'q = zurück ins Menü' 'q = back to menu')"
+        echo "$(say 'q = zurück ins Menü · s = Job stoppen' 'q = back to menu · s = stop job')"
         echo ""
 
         if [[ -f "$LOG_FILE" ]]; then
@@ -1977,6 +2182,14 @@ live_progress_view() {
         if [[ "$key" == "q" ]]; then break; fi
         read -r -n 1 -t 2 key || true
         if [[ "$key" == "q" ]]; then break; fi
+        if [[ "$key" == "s" || "$key" == "S" ]] && is_running; then
+            echo ""
+            read -r -p "$(say 'Laufenden Job wirklich stoppen? (j/n): ' 'Really stop the running job? (y/n): ')" key
+            if [[ "$key" =~ ^[jJyY] ]]; then
+                stop_running_job || true
+            fi
+            key=""
+        fi
 
         if ! is_running; then
             echo ""
@@ -2006,7 +2219,9 @@ show_next_step_hint() {
             lines+=("$(say '⏳ Upload läuft im Hintergrund.' '⏳ Upload is running in the background.')")
             lines+=("$(say '   Den PC möglichst nicht neu starten oder ausschalten.' '   Avoid rebooting or shutting down the PC.')")
             lines+=("$(say '   Falls doch: kein Problem – danach mit 1 fortsetzen.' '   If you must: no problem – resume with 1 afterwards.')")
-            lines+=("$(say '   Fortschritt ansehen: 9' '   Watch progress: 9')")
+            lines+=("$(say '   Fortschritt ansehen: 9 · Upload stoppen: s' '   Watch progress: 9 · Stop upload: s')")
+        elif [[ "$job" == DOWNLOAD* ]]; then
+            lines+=("$(say '⏳ Download läuft im Hintergrund. Stoppen: s' '⏳ Download is running in the background. Stop: s')")
         fi
     elif upload_unfinished; then
         local started img started_txt
@@ -2014,6 +2229,11 @@ show_next_step_hint() {
         img="$(upload_marker_get image)"
         started_txt="$(date -d "@${started:-0}" '+%d.%m.%Y %H:%M' 2>/dev/null || echo '?')"
         lines+=("$(say "⚠ Der letzte Upload wurde nicht fertig (gestartet ${started_txt})." "⚠ The last upload did not finish (started ${started_txt}).")")
+        if [[ "$job" == *"Repo-Lock"* || "$job" == *"repo lock"* ]]; then
+            lines+=("$(say '   Ein anderes Programm (z. B. Vorta) hat den Repo-Lock gebrochen und' '   Another program (e.g. Vorta) broke the repo lock and may have')")
+            lines+=("$(say '   evtl. gleichzeitig ins Repo geschrieben. Vor dem Fortsetzen prüfen:' '   written into the repo at the same time. Before resuming, check:')")
+            lines+=("$(say '   borg check --repository-only (Details im Log: 5)' '   borg check --repository-only (details in the log: 5)')")
+        fi
         [[ -n "$img" ]] && lines+=("$(say "   Datei: $(basename -- "$img")" "   File: $(basename -- "$img")")")
         if [[ -n "$img" && ! -f "$img" ]]; then
             lines+=("$(say '→ Die Datei ist gerade nicht erreichbar: Backup-Platte' '→ The file is not reachable right now: connect and')")
@@ -2079,6 +2299,9 @@ show_menu() {
     echo -e "${C}9)  $(say 'Live Progress (Log folgen)' 'Live progress (follow log)')${NC}"
     echo -e "${C}10) $(say 'systemd User-Service/Timer installieren' 'Install systemd user service/timer')${NC}"
     echo -e "${C}11) $(say 'Repo-Lock brechen (borg break-lock)' 'Break repo lock (borg break-lock)')${NC}"
+    if is_running; then
+        echo -e "${Y}s)  $(say 'Laufenden Job stoppen' 'Stop running job')${NC}"
+    fi
     echo -e "${C}q)  $(say 'Beenden' 'Quit')${NC}"
     echo ""
 }
@@ -2167,6 +2390,10 @@ if [[ $# -gt 0 ]]; then
             echo "$(get_job_status_formatted)"
             exit 0
             ;;
+        stop)
+            stop_running_job || exit 1
+            exit 0
+            ;;
         *)
             echo "Usage:"
             echo "  $0 upload"
@@ -2174,6 +2401,7 @@ if [[ $# -gt 0 ]]; then
             echo "  $0 break-lock"
             echo "  $0 install-service"
             echo "  $0 status"
+            echo "  $0 stop"
             exit 2
             ;;
     esac
@@ -2369,6 +2597,17 @@ while true; do
         11)
             break_lock_repo
             pause
+            ;;
+        s|S)
+            if is_running; then
+                echo "$(say 'Bereits übertragene Teile bleiben im Repo; mit 1 geht es später dort weiter.' \
+                            'Parts already transferred stay in the repo; option 1 continues from there later.')"
+                read -r -p "$(say 'Laufenden Job wirklich stoppen? (j/n): ' 'Really stop the running job? (y/n): ')" yn
+                if [[ "$yn" =~ ^[jJyY] ]]; then
+                    stop_running_job || true
+                    pause
+                fi
+            fi
             ;;
         q)
             echo "$(say 'Tschüss!' 'Bye!')"

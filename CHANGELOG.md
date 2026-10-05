@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.20 - 2026-10-05
+
+- Fixed: when another program on this PC (for example Vorta) ran `borg break-lock` on the repository during an upload, the script kept showing "UPLOAD: running". Borg 1.x notices a broken lock only at the very end, so both programs wrote into the repository at the same time. A watchdog now detects a foreign `borg break-lock` on the same repository and stops the job within about a second. The status reads "✗ UPLOAD: ABORTED – repo lock broken by another program", and the **What now?** box asks to run `borg check --repository-only` before resuming. Disable with `LOCK_WATCHDOG=no`.
+- New: stop a running upload or download manually: menu option **s** (only shown while a job runs), **s** in the live view, or `borgbase_manager.sh stop`. Borg gets SIGINT first and writes a checkpoint, so option 1 resumes from there. If Borg does not end within `STOP_GRACE_SECONDS` (default 60), the job is terminated. The status reads "✗ UPLOAD: STOPPED (manually) – resume with 1". Stopping during the cleanup after a successful upload reports the backup as complete.
+- A stop request also ends the wait between SSH reconnect attempts and skips the next retry.
+
 ## v1.8.19 - 2026-10-01
 
 - An "UPLOAD: INTERRUPTED" status is now checked against the log: if the last upload in the log reached "UPLOAD SUCCESSFUL", the backup is complete and only the cleanup afterwards was cut short. The status then reads "✓ UPLOAD: Finished (only cleanup interrupted)" and the **What now?** box says there is nothing to do.

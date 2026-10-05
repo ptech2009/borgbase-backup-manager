@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.19-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.20-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -117,6 +117,7 @@ After wizard completion, config is stored in:
 ./borgbase_manager.sh upload
 ./borgbase_manager.sh download <archive-name>
 ./borgbase_manager.sh status
+./borgbase_manager.sh stop            # stop the running upload/download
 ./borgbase_manager.sh break-lock
 ./borgbase_manager.sh install-service
 ```
@@ -143,6 +144,7 @@ Run the script without arguments to access the interactive menu:
 9. **Live Progress** - Watch current operation in real-time
 10. **Install systemd Units** - Set up automatic backups
 11. **Break Repository Lock** - Force unlock if needed
+S. **Stop Running Job** - Only shown while a job runs; also `s` in the live view
 Q. **Quit**
 
 ### Upload Workflow
@@ -201,6 +203,8 @@ BORG_LOCK_WAIT=60               # Wait time for repo locks
 AUTO_RETRY_ON_SSH_DISCONNECT=yes # Retry interrupted SSH uploads automatically
 UPLOAD_MAX_RETRIES=5             # Retry attempts after SSH disconnects
 UPLOAD_RETRY_DELAY=30            # Seconds to wait before retrying
+LOCK_WATCHDOG=yes                # Stop the job when another program breaks the repo lock
+STOP_GRACE_SECONDS=60            # How long "stop" waits for Borg's checkpoint before killing
 AUTO_ACCEPT_HOSTKEY=no          # Auto-add SSH host key
 AUTO_TEST_SSH=yes               # Test SSH on startup
 AUTO_TEST_REPO=yes              # Test repo access on startup
@@ -281,11 +285,27 @@ If the box says **"Your backup is completely stored"**, the upload had already f
 
 Do not want to resume? Choose **7** to remove the hint.
 
+### Stopping an Upload
+Choose **s** in the menu (only shown while a job runs), press **s** in the live view, or run `./borgbase_manager.sh stop` (with `sudo` if the job was started with `sudo`). Borg first writes a checkpoint, so option **1** later resumes where it stopped. If Borg does not end within `STOP_GRACE_SECONDS`, the job is terminated.
+
+Do not stop a running upload from another program such as Vorta: see the next section.
+
+### Another Program Broke the Repository Lock
+If Vorta (or another Borg client on this PC) finds the repository locked by a running upload and you let it break the lock, both programs write into the repository at the same time. Borg 1.x notices the lost lock only at the very end of the upload, and until then the script would keep showing "running".
+
+The script now watches for `borg break-lock` on its repository from any other program on this PC and stops its own job within about a second. The status then reads **"ABORTED – repo lock broken by another program"**. Before resuming with **1**, check the repository:
+
+```bash
+borg check --repository-only ssh://user@user.repo.borgbase.com/./repo
+```
+
+The watchdog only sees processes on this PC. A break-lock from another host is not detected; Borg then fails at the end of the upload.
+
 ### Repository Locked
 If you see "Repository locked" warnings:
 1. Check if another process is using the repository
 2. If your own job is running, this is normal (yellow warning)
-3. Use menu option **11** to break the lock if needed
+3. Use menu option **11** to break the lock if needed, but never while an upload from this or another program is running
 
 ### Connection Failures
 1. Test connection: Menu option **4** or `./borgbase_manager.sh status`
