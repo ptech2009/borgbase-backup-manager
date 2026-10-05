@@ -49,7 +49,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.20"
+APP_VERSION="v1.8.21"
 
 STATUS_FIELD_WIDTH=49
 
@@ -197,8 +197,9 @@ build_resource_prefix() {
 say() { local de="$1" en="$2"; [[ "${UI_LANG:-de}" == "en" ]] && echo -e "$en" || echo -e "$de"; }
 
 pause() {
-    local msg="${1:-}"
-    [[ -n "$msg" ]] && read -r -p "$msg" _ || read -r -p "" _
+    # Always show a prompt: a bare read looks like a hang after long jobs.
+    local msg="${1:-$(say '\nWeiter mit Enter... ' '\nPress Enter to continue... ')}"
+    read -r -p "$(echo -e "$msg")" _ || true
 }
 
 # -------------------- Status (JOB + CONN) --------------------
@@ -1165,6 +1166,23 @@ test_borg_repo() {
         set_conn_status "$(say 'WARNUNG: Repo gesperrt (Lock-Timeout).' 'WARNING: Repo locked (timeout).')"
         return 2
     fi
+    # Show borg's own error instead of a bare "connection failed".
+    echo -e "${R}borg info (rc=${rc}):${NC}"
+    # Borg appends a debug block (platform, versions, argv) after the actual
+    # error - drop it, otherwise it hides the one line that matters.
+    printf '%s\n' "$out" | grep -v '^[[:space:]]*$' \
+        | grep -vE '^(Borg server: )?(Platform|Linux|Borg|PID|sys\.argv|SSH_ORIGINAL_COMMAND):' \
+        | tail -n 8 | sed 's/^/  /'
+    # Index points to a segment that is gone: the repo is damaged (typically
+    # two clients writing at once after a "borg break-lock"), not the link.
+    if echo "$out" | grep -qE "FileNotFoundError.*/data/[0-9]+/[0-9]+|IntegrityError|Index object count mismatch"; then
+        set_conn_status "$(say 'FEHLER: Repo beschädigt – borg check --repair nötig.' 'ERROR: Repo damaged – borg check --repair needed.')"
+        echo -e "${Y}$(say '  → Verbindung steht, aber das Repo ist beschädigt (Index verweist auf fehlende Daten).' \
+                           '  → Connection works, but the repo is damaged (index points to missing data).')${NC}"
+        echo -e "${Y}$(say '  → Andere Clients (Vorta) pausieren, dann Menüpunkt 12 (Repo reparieren).' \
+                           '  → Pause other clients (Vorta), then menu item 12 (repair repo).')${NC}"
+        return 3
+    fi
     return 1
 }
 
@@ -1192,6 +1210,9 @@ test_connection() {
     elif (( conn_rc == 2 )); then
         echo -e "${Y}$(say 'Repo ist derzeit gesperrt (Lock), aber erreichbar.' 'Repo is currently locked but reachable.')${NC}"
         return 0
+    elif (( conn_rc == 3 )); then
+        echo -e "${R}$(say 'Repo beschädigt.' 'Repo damaged.')${NC}"
+        return 1
     else
         set_conn_status "$(say 'FEHLER: Repo-Verbindung fehlgeschlagen.' 'ERROR: Repo connection failed.')"
         echo -e "${R}$(say 'Repo-Verbindung fehlgeschlagen.' 'Repo connection failed.')${NC}"
@@ -2146,6 +2167,107 @@ break_lock_repo() {
     borg break-lock "$REPO" 2>&1 | tee -a "$LOG_FILE"
 }
 
+# -------------------- Repo repair (borg check --repair) --------------------
+# For a damaged repo, e.g. an index that points to segments which are gone
+# after two clients wrote at once. Runs in the foreground: it needs a
+# confirmation, and on a large repo it takes hours (the server reads every
+# segment). An interrupted repair can simply be started again.
+run_borg_check() {
+    local label="$1"; shift
+    local rc=0 inhibit=()
+    if [[ "${INHIBIT_SLEEP:-yes}" == "yes" ]] && command -v systemd-inhibit >/dev/null 2>&1 \
+        && systemd-inhibit --what=sleep:idle --mode="${INHIBIT_MODE}" --why=probe true >/dev/null 2>&1; then
+        inhibit=(systemd-inhibit --what=sleep:idle --mode="${INHIBIT_MODE}" --why="${APP_NAME}: borg check")
+    fi
+    {
+        echo ""
+        echo "=== ${label}: $(date) ==="
+        echo "borg check $*"
+    } >> "$LOG_FILE" 2>/dev/null || true
+    # Our own confirmation replaces borg's interactive "Type YES" prompt.
+    # pipefail + set -e: read borg's rc inside the group, before "|| true".
+    { BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES "${inhibit[@]}" "${BORG_NICE[@]}" \
+        borg check --lock-wait "$BORG_LOCK_WAIT" --progress --verbose "$@" "$REPO" 2>&1 \
+        | tee -a "$LOG_FILE"; rc="${PIPESTATUS[0]:-1}"; } || true
+    echo "=== ${label} rc=${rc}: $(date) ===" >> "$LOG_FILE" 2>/dev/null || true
+    return "$rc"
+}
+
+repair_repo() {
+    if is_running; then
+        echo -e "${Y}$(say '⚠ Ein Job läuft – erst stoppen (s), dann reparieren.' '⚠ A job is running – stop it first (s), then repair.')${NC}"
+        return 1
+    fi
+    if [[ ! -t 0 ]]; then
+        echo "$(say 'Reparatur nur interaktiv (Bestätigung nötig).' 'Repair is interactive only (confirmation required).')" >&2
+        return 2
+    fi
+
+    local authority
+    authority="$(_repo_authority "$REPO")"; authority="${authority%%:*}"
+    local others=""
+    [[ -n "$authority" ]] && others="$(borg_processes | awk -v a="$authority" 'index($0, a) { print "  PID " $1 ": " $3 }')" || true
+    if [[ -n "$others" ]]; then
+        echo -e "${R}$(say '✗ Andere Borg-Prozesse arbeiten gerade mit diesem Repo:' '✗ Other borg processes are using this repo right now:')${NC}"
+        echo "$others"
+        echo "$(say '  Erst beenden lassen (bei Vorta: Backup abbrechen), dann erneut versuchen.' '  Let them finish first (Vorta: cancel the backup), then try again.')"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${Y}$(say 'REPO REPARIEREN (borg check --repair)' 'REPAIR REPO (borg check --repair)')${NC}"
+    echo "$(say '  Repo: ' '  Repo: ')${REPO}"
+    echo "$(say '  • Baut den Repo-Index aus den vorhandenen Daten neu auf. Verweise auf' '  • Rebuilds the repo index from the data that exists. References to')"
+    echo "$(say '    fehlende Daten werden entfernt – das ist endgültig.' '    missing data are removed – this cannot be undone.')"
+    echo "$(say '  • Dauert bei großen Repos Stunden. Terminal offen lassen; ein Abbruch' '  • Takes hours on a large repo. Keep the terminal open; an interrupted')"
+    echo "$(say '    schadet nicht, die Reparatur kann neu gestartet werden.' '    repair does no harm, it can be started again.')"
+    if pgrep -x vorta >/dev/null 2>&1 || pgrep -f '/vorta' >/dev/null 2>&1; then
+        echo -e "${Y}$(say '  • Vorta läuft: geplante Backups vorher pausieren, sonst schreibt Vorta' '  • Vorta is running: pause scheduled backups first, or Vorta may write')${NC}"
+        echo -e "${Y}$(say '    mitten in die Reparatur.' '    in the middle of the repair.')${NC}"
+    fi
+    echo -e "${R}$(say '  Niemals borg break-lock während der Reparatur!' '  Never run borg break-lock during the repair!')${NC}"
+    echo ""
+    echo "$(say 'Tippe REPAIR zur Bestätigung:' 'Type REPAIR to confirm:')"
+    local confirm
+    read -r confirm
+    if [[ "$confirm" != "REPAIR" ]]; then
+        echo "$(say 'Abgebrochen.' 'Cancelled.')"
+        return 1
+    fi
+
+    ensure_logfile_writable
+    setup_borg_env || return 1
+
+    echo ""
+    echo -e "${C}$(say 'Schritt 1/2: Repository reparieren (Index, Segmente)...' 'Step 1/2: repairing repository (index, segments)...')${NC}"
+    set_conn_status "$(say 'REPARATUR: Repository läuft...' 'REPAIR: repository running...')"
+    if ! run_borg_check "REPAIR repository" --repository-only --repair; then
+        set_conn_status "$(say 'FEHLER: Repo-Reparatur fehlgeschlagen.' 'ERROR: Repo repair failed.')"
+        echo -e "${R}$(say '✗ Repository-Reparatur fehlgeschlagen – Details oben bzw. im Log (5).' '✗ Repository repair failed – see above or the log (5).')${NC}"
+        return 1
+    fi
+    echo -e "${G}$(say '✓ Repository repariert.' '✓ Repository repaired.')${NC}"
+
+    echo ""
+    echo "$(say 'Schritt 2/2 prüft alle Archive und markiert Dateien mit fehlenden Daten' 'Step 2/2 checks all archives and marks files with missing data')"
+    echo "$(say '(braucht die Passphrase, dauert ebenfalls lange). Empfohlen.' '(needs the passphrase, also takes long). Recommended.')"
+    local yn
+    read -r -p "$(say 'Archive jetzt prüfen und reparieren? (j/n): ' 'Check and repair archives now? (y/n): ')" yn
+    if [[ "$yn" =~ ^[jJyY] ]]; then
+        set_conn_status "$(say 'REPARATUR: Archive laufen...' 'REPAIR: archives running...')"
+        if ! run_borg_check "REPAIR archives" --archives-only --repair; then
+            set_conn_status "$(say 'FEHLER: Archiv-Reparatur fehlgeschlagen.' 'ERROR: Archive repair failed.')"
+            echo -e "${R}$(say '✗ Archiv-Reparatur fehlgeschlagen – Details oben bzw. im Log (5).' '✗ Archive repair failed – see above or the log (5).')${NC}"
+            return 1
+        fi
+        echo -e "${G}$(say '✓ Archive geprüft. Meldungen zu „missing“/„replaced“ zeigen betroffene Dateien.' '✓ Archives checked. "missing"/"replaced" messages name affected files.')${NC}"
+    fi
+
+    echo ""
+    echo "$(say 'Teste Verbindung...' 'Testing connection...')"
+    test_connection
+}
+
 # -------------------- Live progress --------------------
 live_progress_view() {
     ensure_logfile_writable
@@ -2299,6 +2421,7 @@ show_menu() {
     echo -e "${C}9)  $(say 'Live Progress (Log folgen)' 'Live progress (follow log)')${NC}"
     echo -e "${C}10) $(say 'systemd User-Service/Timer installieren' 'Install systemd user service/timer')${NC}"
     echo -e "${C}11) $(say 'Repo-Lock brechen (borg break-lock)' 'Break repo lock (borg break-lock)')${NC}"
+    echo -e "${C}12) $(say 'Repo prüfen & reparieren (borg check --repair)' 'Check & repair repo (borg check --repair)')${NC}"
     if is_running; then
         echo -e "${Y}s)  $(say 'Laufenden Job stoppen' 'Stop running job')${NC}"
     fi
@@ -2382,6 +2505,10 @@ if [[ $# -gt 0 ]]; then
             break_lock_repo
             exit $?
             ;;
+        repair)
+            rc=0; repair_repo || rc=$?
+            exit "$rc"
+            ;;
         install-service)
             install_systemd_user_units
             exit $?
@@ -2399,6 +2526,7 @@ if [[ $# -gt 0 ]]; then
             echo "  $0 upload"
             echo "  $0 download <archive>"
             echo "  $0 break-lock"
+            echo "  $0 repair"
             echo "  $0 install-service"
             echo "  $0 status"
             echo "  $0 stop"
@@ -2596,6 +2724,10 @@ while true; do
             ;;
         11)
             break_lock_repo
+            pause
+            ;;
+        12)
+            repair_repo || true
             pause
             ;;
         s|S)

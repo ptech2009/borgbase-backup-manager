@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.20-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.21-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -119,6 +119,7 @@ After wizard completion, config is stored in:
 ./borgbase_manager.sh status
 ./borgbase_manager.sh stop            # stop the running upload/download
 ./borgbase_manager.sh break-lock
+./borgbase_manager.sh repair          # borg check --repair (interactive)
 ./borgbase_manager.sh install-service
 ```
 
@@ -144,6 +145,7 @@ Run the script without arguments to access the interactive menu:
 9. **Live Progress** - Watch current operation in real-time
 10. **Install systemd Units** - Set up automatic backups
 11. **Break Repository Lock** - Force unlock if needed
+12. **Check & Repair Repository** - `borg check --repair` after damage (asks for confirmation)
 S. **Stop Running Job** - Only shown while a job runs; also `s` in the live view
 Q. **Quit**
 
@@ -299,6 +301,8 @@ The script now watches for `borg break-lock` on its repository from any other pr
 borg check --repository-only ssh://user@user.repo.borgbase.com/./repo
 ```
 
+If option **4** then reports **"Repo damaged"** (for example `FileNotFoundError` on a file under `data/`), see [Repository Damaged](#repository-damaged).
+
 The watchdog only sees processes on this PC. A break-lock from another host is not detected; Borg then fails at the end of the upload.
 
 ### Repository Locked
@@ -307,8 +311,18 @@ If you see "Repository locked" warnings:
 2. If your own job is running, this is normal (yellow warning)
 3. Use menu option **11** to break the lock if needed, but never while an upload from this or another program is running
 
+### Repository Damaged
+Option **4** shows "Repo damaged – borg check --repair needed" when the repository index points to data that is gone, typically after two programs wrote into it at the same time.
+
+1. Pause other Borg clients that use the same repository (in Vorta: disable scheduled backups)
+2. Choose menu option **12** or run `./borgbase_manager.sh repair` (with `sudo` if you run the script with `sudo`) and type `REPAIR`
+3. Step 1 repairs the repository; step 2 checks all archives. An archive whose metadata is missing is removed, all others stay usable
+4. Run option **3** to see which archives remain, and upload again what was lost
+
+On a large repository each step can take hours. An interrupted repair can be started again. Never run `borg break-lock` while it runs.
+
 ### Connection Failures
-1. Test connection: Menu option **4** or `./borgbase_manager.sh status`
+1. Test connection: Menu option **4** or `./borgbase_manager.sh status`. Option 4 shows Borg's own error message
 2. Verify SSH key is added to BorgBase
 3. Check `~/.ssh/known_hosts` contains the BorgBase host
 4. Re-run wizard to reconfigure: Menu option **8**

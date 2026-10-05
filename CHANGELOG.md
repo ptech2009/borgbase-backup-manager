@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.21 - 2026-10-05
+
+- New: menu option **12** (Check & repair repo) and `borgbase_manager.sh repair` run `borg check --repair` for a damaged repository, for example after two programs wrote into it at the same time. It refuses while a job runs or while another Borg process on this PC uses the repository, warns if Vorta is running, and asks you to type `REPAIR`. Step 1 repairs the repository (index and segments). Step 2 (optional, needs the passphrase) checks all archives and removes what cannot be recovered. The connection test runs again at the end. Sleep is blocked while it runs.
+- Option 4 (Test connection) now shows Borg's own error line, not just "Repo connection failed". Borg's debug block (platform, versions, arguments) is left out because it hid the actual error.
+- A damaged repository (index points to missing data, integrity errors) is now reported as "Repo damaged – borg check --repair needed" with a pointer to option 12, not as a connection failure.
+- After a menu action the script now shows "Press Enter to continue...". Before, it waited without a prompt, which looked like a hang after long operations.
+
 ## v1.8.20 - 2026-10-05
 
 - Fixed: when another program on this PC (for example Vorta) ran `borg break-lock` on the repository during an upload, the script kept showing "UPLOAD: running". Borg 1.x notices a broken lock only at the very end, so both programs wrote into the repository at the same time. A watchdog now detects a foreign `borg break-lock` on the same repository and stops the job within about a second. The status reads "✗ UPLOAD: ABORTED – repo lock broken by another program", and the **What now?** box asks to run `borg check --repository-only` before resuming. Disable with `LOCK_WATCHDOG=no`.
