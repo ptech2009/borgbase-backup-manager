@@ -1,0 +1,2 @@
+# UI output consistently wraps the bilingual say() helper in echo.
+disable=SC2005

@@ -36,8 +36,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install ShellCheck and BorgBackup
+        run: sudo apt-get update && sudo apt-get install -y shellcheck borgbackup
 
       - name: Bash syntax check
         run: |
@@ -49,3 +49,6 @@ jobs:
 
       - name: Git diff check
         run: git diff --check
+
+      - name: Retry, progress and diagnostics regression tests
+        run: bash tests/retry_and_diagnostics.sh

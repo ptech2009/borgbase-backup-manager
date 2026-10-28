@@ -2,7 +2,7 @@
 
 A secure, production-ready backup management tool for uploading and downloading Panzerbackup artifacts to/from BorgBase repositories using BorgBackup.
 
-[![Version](https://img.shields.io/badge/version-1.8.21-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.22-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![BorgBackup](https://img.shields.io/badge/BorgBackup-1.2%2B-blue.svg)](https://www.borgbackup.org/)
@@ -117,6 +117,7 @@ After wizard completion, config is stored in:
 ./borgbase_manager.sh upload
 ./borgbase_manager.sh download <archive-name>
 ./borgbase_manager.sh status
+./borgbase_manager.sh diagnose        # job/log age and measured SSH transfer rate
 ./borgbase_manager.sh stop            # stop the running upload/download
 ./borgbase_manager.sh break-lock
 ./borgbase_manager.sh repair          # borg check --repair (interactive)
@@ -147,6 +148,7 @@ Run the script without arguments to access the interactive menu:
 11. **Break Repository Lock** - Force unlock if needed
 12. **Check & Repair Repository** - `borg check --repair` after damage (asks for confirmation)
 S. **Stop Running Job** - Only shown while a job runs; also `s` in the live view
+D. **Diagnose Runtime/Transfer** - Show recent progress and sample the job's SSH transfer rate
 Q. **Quit**
 
 ### Upload Workflow
@@ -331,6 +333,16 @@ On a large repository each step can take hours. An interrupted repair can be sta
 If the log shows `client_loop: send disconnect: Broken pipe` or `Connection closed by remote host`, the SSH session was closed during or near the end of the upload. Resume it with menu option **1**; Borg reuses existing chunks/checkpoints and does not resend everything.
 
 The default SSH keepalive settings are tuned for long desktop uploads. On Linux desktops, `systemd-inhibit` also blocks automatic sleep/idle and lid-switch suspend while the upload worker is running.
+
+### Upload Takes Much Longer After a Network Outage
+
+Choose **d** in the menu or run `./borgbase_manager.sh diagnose`. If the job was started with `sudo`, run the diagnostic command with `sudo` as well. It shows job runtime, recent log output, and measures acknowledged SSH bytes and TCP retransmissions over three seconds. It needs `ss` from `iproute2` for TCP measurements and does not open or unlock the repository.
+
+A slow connection can keep a large image upload running for days. Check the Wi-Fi/Ethernet connection and internet uplink when the measured rate is low. A three-second sample with no traffic does not prove that Borg is stuck: reading already uploaded chunks, loading caches, and finalizing an archive can happen without continuous network traffic. SSH counters include protocol traffic and are not a percentage of the backup completed.
+
+Network resets, timeouts, unreachable networks and DNS failures now trigger the same bounded retry policy as broken pipes. Each attempt logs its start/end timestamp, duration and return code. The menu shows when it is waiting for a retry. Authentication, repository corruption and disk-full errors are not automatically retried. A slow transfer is not automatically restarted just because it has run a long time.
+
+With `stdbuf` installed, new progress lines reach the log immediately. The live viewer also handles older logs containing carriage-return progress without displaying hours of old updates at once.
 
 ### Space Issues
 - Enable `PRUNE_BEFORE_CREATE=yes` to free space before uploads

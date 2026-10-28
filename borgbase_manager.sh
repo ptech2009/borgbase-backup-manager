@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BorgBase Backup Manager v1.8.19
+# BorgBase Backup Manager v1.8.22
 #
 # Features / Fixes:
 # - SECURITY FIX: Uses BORG_PASSCOMMAND to prevent environment leak
@@ -49,9 +49,7 @@ fi
 
 # -------------------- UI constants --------------------
 APP_NAME="BorgBase Backup Manager"
-APP_VERSION="v1.8.21"
-
-STATUS_FIELD_WIDTH=49
+APP_VERSION="v1.8.22"
 
 strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
 
@@ -198,7 +196,7 @@ say() { local de="$1" en="$2"; [[ "${UI_LANG:-de}" == "en" ]] && echo -e "$en" |
 
 pause() {
     # Always show a prompt: a bare read looks like a hang after long jobs.
-    local msg="${1:-$(say '\nWeiter mit Enter... ' '\nPress Enter to continue... ')}"
+    local msg; msg="$(say '\nWeiter mit Enter... ' '\nPress Enter to continue... ')"
     read -r -p "$(echo -e "$msg")" _ || true
 }
 
@@ -377,7 +375,7 @@ write_pid_record() {
 
 read_pid() {
     local pid=""
-    [[ -s "$PID_FILE" ]] && read -r pid _ < "$PID_FILE" 2>/dev/null || true
+    if [[ -s "$PID_FILE" ]]; then read -r pid _ < "$PID_FILE" 2>/dev/null || true; fi
     echo "${pid:--}"
 }
 
@@ -533,6 +531,76 @@ retry_wait() {
     ! stop_requested
 }
 
+# Flush Borg's carriage-return progress as soon as it arrives, even into pipes.
+borg_progress_lines() {
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -oL tr '\r' '\n'
+    else
+        tr '\r' '\n'
+    fi
+}
+
+upload_connection_failed() {
+    grep -qiE 'broken pipe|connection (closed|reset|timed out|refused)|connectionclosed|connectionreseterror|timeout, server .* not responding|server .* not responding|client_loop: send disconnect|remote: .*no route to host|network is unreachable|no route to host|temporary failure in name resolution|could not resolve hostname' "$1"
+}
+
+# Shared by image and directory uploads: retain Borg's rc and also fail if a
+# log/progress pipe fails. Only transport errors are eligible for a retry.
+# rc and upload_error_hint are outputs in worker_upload's local scope.
+run_upload_create() {
+    local src_dir="$1" archive_name="$2" include_file="${3:-}"
+    local attempt=0 max=$(( UPLOAD_MAX_RETRIES + 1 )) started elapsed create_out
+    local -a pipe_rc create_args
+    create_args=(create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL"
+                 --stats --progress --compression lz4 "${REPO}::${archive_name}")
+    if [[ -n "$include_file" ]]; then
+        create_args+=(--paths-from-stdin)
+    else
+        create_args+=("$src_dir")
+    fi
+    while (( ++attempt <= max )); do
+        stop_requested && return 130
+        if (( attempt > 1 )); then
+            set_job_status "$(say "UPLOAD: Warte auf Neuversuch ${attempt}/${max}..." "UPLOAD: Waiting for retry ${attempt}/${max}...")"
+            echo "$(say "Netzwerkfehler – Neuversuch ${attempt}/${max} in ${UPLOAD_RETRY_DELAY}s; vorhandene Chunks werden wiederverwendet." \
+                        "Network error – retry ${attempt}/${max} in ${UPLOAD_RETRY_DELAY}s; existing chunks will be reused.")" | tee -a "$LOG_FILE"
+            retry_wait "$UPLOAD_RETRY_DELAY" || return 130
+        fi
+        set_job_status "$(say "UPLOAD: ${archive_name} läuft (Versuch ${attempt}/${max})..." \
+                            "UPLOAD: ${archive_name} running (attempt ${attempt}/${max})...")"
+        started="$(date +%s)"
+        echo "$(say "Upload-Versuch ${attempt}/${max} gestartet" "Upload attempt ${attempt}/${max} started"): $(date -Is)" | tee -a "$LOG_FILE"
+        create_out="$(mktemp)"
+        if (
+            if [[ -n "$include_file" ]]; then
+                cd "$src_dir" || exit 1
+                exec < "$include_file"
+            fi
+            "${BORG_NICE[@]}" borg "${create_args[@]}"
+        ) 2>&1 | borg_progress_lines | tee -a "$LOG_FILE" | tee "$create_out"; then
+            pipe_rc=(0 0 0 0)
+        else
+            pipe_rc=("${PIPESTATUS[@]}")
+        fi
+        rc="${pipe_rc[0]}"
+        upload_error_hint=""
+        if upload_connection_failed "$create_out"; then upload_error_hint="ssh_disconnect"; fi
+        rm -f "$create_out"
+        # A logging failure must never be reported as a successful backup or
+        # retried as a network error, even when Borg itself returned zero.
+        if (( pipe_rc[1] != 0 || pipe_rc[2] != 0 || pipe_rc[3] != 0 )); then
+            (( rc != 0 )) || rc=2
+            upload_error_hint=""
+        fi
+        elapsed=$(( $(date +%s) - started ))
+        echo "$(say "Upload-Versuch ${attempt}/${max} beendet" "Upload attempt ${attempt}/${max} ended"): $(date -Is), rc=${rc}, $(format_duration "$elapsed")" | tee -a "$LOG_FILE"
+        stop_requested && return 130
+        (( rc == 0 )) && return 0
+        [[ "$upload_error_hint" == "ssh_disconnect" && "$AUTO_RETRY_ON_SSH_DISCONNECT" == "yes" ]] || return "$rc"
+    done
+    return "$rc"
+}
+
 # Borg 1.x notices a broken lock only when it releases it at the very end. Until
 # then another client - here: Vorta after "borg break-lock" - writes into the
 # repo at the same time. Watch for a break-lock on our repo from any other
@@ -633,7 +701,7 @@ ensure_logfile_writable() {
 expand_path() {
     local p="${1:-}"
     [[ -z "$p" ]] && { echo ""; return 0; }
-    if [[ "$p" == "~/"* ]]; then echo "$HOME/${p#~/}"; return 0; fi
+    if [[ "$p" == \~/* ]]; then echo "$HOME/${p#\~/}"; return 0; fi
     if [[ "$p" == "~" ]]; then echo "$HOME"; return 0; fi
     echo "$p"
 }
@@ -742,7 +810,7 @@ load_ssh_key_to_agent() {
     fi
     
     if [[ -f "$SSH_KEY_PASSPHRASE_FILE" && -r "$SSH_KEY_PASSPHRASE_FILE" ]]; then
-        cat "$SSH_KEY_PASSPHRASE_FILE" | SSH_ASKPASS_REQUIRE=never ssh-add "$SSH_KEY" 2>/dev/null || {
+        SSH_ASKPASS_REQUIRE=never ssh-add "$SSH_KEY" < "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || {
             DISPLAY=:0 SSH_ASKPASS="$(which ssh-askpass 2>/dev/null || echo /bin/false)" \
                 ssh-add "$SSH_KEY" < "$SSH_KEY_PASSPHRASE_FILE" 2>/dev/null || return 1
         }
@@ -765,7 +833,8 @@ load_repo_passphrase() {
         # Ensure permissions are tight every time we read it
         chmod 600 "$PASSPHRASE_FILE" 2>/dev/null || true
         unset BORG_PASSPHRASE
-        export BORG_PASSCOMMAND="cat $(printf '%q' "$PASSPHRASE_FILE")"
+        BORG_PASSCOMMAND="cat $(printf '%q' "$PASSPHRASE_FILE")"
+        export BORG_PASSCOMMAND
         return 0
     fi
     if [[ -n "${BORG_PASSPHRASE:-}" ]]; then
@@ -1128,12 +1197,15 @@ borg_with_ssh() { setup_borg_env || return 1; borg "$@"; }
 # -------------------- Connection test --------------------
 test_ssh_auth() {
     [[ "${AUTO_TEST_SSH}" == "yes" ]] || return 0
-    local host user out port_opt
+    local host user out port
+    local -a ssh_options=()
     host="$(_host_from_repo "${REPO}")"
     user="$(_user_from_repo "${REPO}")"
-    port_opt="$(_ssh_port_opt_from_repo "${REPO}")"
+    port="$(_port_from_repo "${REPO}")"
+    [[ -z "$port" ]] || ssh_options+=(-p "$port")
+    [[ -z "$SSH_KEY" ]] || ssh_options+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
     
-    out="$(ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -o ServerAliveInterval="${SSH_SERVER_ALIVE_INTERVAL}" -o ServerAliveCountMax="${SSH_SERVER_ALIVE_COUNT_MAX}" -o TCPKeepAlive="${SSH_TCP_KEEPALIVE}" -o IPQoS="${SSH_IPQOS}" ${port_opt} ${SSH_KEY:+-i "$SSH_KEY" -o IdentitiesOnly=yes} "${user}@${host}" -- borg --version 2>&1 || true)"
+    out="$(ssh -T -o RequestTTY=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -o ServerAliveInterval="${SSH_SERVER_ALIVE_INTERVAL}" -o ServerAliveCountMax="${SSH_SERVER_ALIVE_COUNT_MAX}" -o TCPKeepAlive="${SSH_TCP_KEEPALIVE}" -o IPQoS="${SSH_IPQOS}" "${ssh_options[@]}" "${user}@${host}" -- borg --version 2>&1 || true)"
     echo "$out" >> "$LOG_FILE" 2>/dev/null || true
     
     if echo "$out" | grep -qiE 'host key verification failed|remote host identification has changed'; then
@@ -1284,7 +1356,8 @@ interactive_archive_selection() {
     fi
     
     local to_delete=()
-    local ranges=($selection)
+    local -a ranges
+    read -r -a ranges <<< "$selection"
     
     for range in "${ranges[@]}"; do
         if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
@@ -1435,8 +1508,8 @@ show_prune_preview() {
         return 0
     fi
     
-    local to_delete=$((total - keep))
-    echo "$(say 'Gesamt: '"$total"' Archive | Behalten: '"$keep"' | Löschen: '"$to_delete" 'Total: '"$total"' archives | Keep: '"$keep"' | Delete: '"$to_delete")"
+    local delete_count=$((total - keep))
+    echo "$(say 'Gesamt: '"$total"' Archive | Behalten: '"$keep"' | Löschen: '"$delete_count" 'Total: '"$total"' archives | Keep: '"$keep"' | Delete: '"$delete_count")"
     echo ""
     
     echo "$(say 'BEHALTEN (neueste):' 'KEEPING (newest):')"
@@ -1659,7 +1732,7 @@ worker_upload() {
         # .sfdisk sidecar exists - it is added only when it is really there.
         sfd="${base}.sfdisk"
 
-        local include_file create_out _attempt _max
+        local include_file
         include_file="$(mktemp)"
 
         {
@@ -1678,74 +1751,11 @@ worker_upload() {
         sed 's/^/  - /' "$include_file" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
 
-        _attempt=0
-        _max=$(( UPLOAD_MAX_RETRIES + 1 ))
-        while (( ++_attempt <= _max )); do
-            if (( _attempt > 1 )); then
-                echo "" | tee -a "$LOG_FILE"
-                echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
-                            "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
-                retry_wait "${UPLOAD_RETRY_DELAY}" || break
-            fi
-
-            create_out="$(mktemp)"
-            if ( cd "$src_dir" && "${BORG_NICE[@]}" borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
-                    --stats --progress --compression lz4 \
-                    "${REPO}::${archive_name}" --paths-from-stdin < "$include_file" ) 2>&1 \
-                    | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
-                rc=0
-            else
-                rc="${PIPESTATUS[0]:-1}"
-            fi
-
-            upload_error_hint=""
-            if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
-                upload_error_hint="ssh_disconnect"
-            fi
-            rm -f "$create_out" 2>/dev/null || true
-
-            stop_requested && break
-            [[ $rc -eq 0 ]] && break
-            [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
-            [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
-        done
-
+        run_upload_create "$src_dir" "$archive_name" "$include_file" || rc=$?
         rm -f "$include_file" 2>/dev/null || true
-
     else
         upload_marker_write "$src_dir" "" "$archive_name"
-        local create_out _attempt _max
-        _attempt=0
-        _max=$(( UPLOAD_MAX_RETRIES + 1 ))
-        while (( ++_attempt <= _max )); do
-            if (( _attempt > 1 )); then
-                echo "" | tee -a "$LOG_FILE"
-                echo "$(say "SSH-Disconnect – Neuversuch ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg setzt am letzten Checkpoint fort)..." \
-                            "SSH disconnect – retry ${_attempt}/${_max} in ${UPLOAD_RETRY_DELAY}s (Borg resumes from last checkpoint)...")" | tee -a "$LOG_FILE"
-                retry_wait "${UPLOAD_RETRY_DELAY}" || break
-            fi
-
-            create_out="$(mktemp)"
-            if "${BORG_NICE[@]}" borg create --lock-wait "$BORG_LOCK_WAIT" --checkpoint-interval "$BORG_CHECKPOINT_INTERVAL" \
-                    --stats --progress --compression lz4 \
-                    "${REPO}::${archive_name}" "${src_dir}" 2>&1 \
-                    | tr '\r' '\n' | tee -a "$LOG_FILE" | tee "$create_out"; then
-                rc=0
-            else
-                rc="${PIPESTATUS[0]:-1}"
-            fi
-
-            upload_error_hint=""
-            if grep -qiE 'broken pipe|connection closed by remote host|client_loop: send disconnect' "$create_out"; then
-                upload_error_hint="ssh_disconnect"
-            fi
-            rm -f "$create_out" 2>/dev/null || true
-
-            stop_requested && break
-            [[ $rc -eq 0 ]] && break
-            [[ "$upload_error_hint" != "ssh_disconnect" ]] && break
-            [[ "${AUTO_RETRY_ON_SSH_DISCONNECT}" != "yes" ]] && break
-        done
+        run_upload_create "$src_dir" "$archive_name" || rc=$?
     fi
 
     if [[ "$rc" -ne 0 ]] && stop_requested; then
@@ -1783,8 +1793,8 @@ worker_upload() {
     echo "$(say '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛' '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛')" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
     if [[ "$upload_error_hint" == "ssh_disconnect" ]]; then
-        echo "$(say "Hinweis: Die SSH-Verbindung wurde nach ${UPLOAD_MAX_RETRIES} Neuversuch(en) wiederholt getrennt (Broken pipe)." \
-                    "Hint: The SSH connection was repeatedly dropped after ${UPLOAD_MAX_RETRIES} retry/retries (Broken pipe).")" | tee -a "$LOG_FILE"
+        echo "$(say "Hinweis: Upload wegen eines Netzwerkfehlers beendet. Tatsächliche Versuche und Dauer stehen oben im Log." \
+                    "Hint: Upload ended after a network error. Actual attempts and durations are logged above.")" | tee -a "$LOG_FILE"
         echo "$(say 'Aktive SSH-Keepalive-Werte:' 'Active SSH keepalive values:') ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}, ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}, TCPKeepAlive=${SSH_TCP_KEEPALIVE}, IPQoS=${SSH_IPQOS}" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
     fi
@@ -1893,7 +1903,7 @@ worker_download() {
     echo "$(say '└─────────────────────────────────────────────────────────┘' '└─────────────────────────────────────────────────────────┘')" | tee -a "$LOG_FILE"
 
     local rc=0
-    if borg extract --lock-wait "$BORG_LOCK_WAIT" --progress "${REPO}::${archive}" 2>&1 | tr '\r' '\n' | tee -a "$LOG_FILE"; then
+    if borg extract --lock-wait "$BORG_LOCK_WAIT" --progress "${REPO}::${archive}" 2>&1 | borg_progress_lines | tee -a "$LOG_FILE"; then
         rc=0
     else
         rc="${PIPESTATUS[0]:-1}"
@@ -2206,7 +2216,9 @@ repair_repo() {
     local authority
     authority="$(_repo_authority "$REPO")"; authority="${authority%%:*}"
     local others=""
-    [[ -n "$authority" ]] && others="$(borg_processes | awk -v a="$authority" 'index($0, a) { print "  PID " $1 ": " $3 }')" || true
+    if [[ -n "$authority" ]]; then
+        others="$(borg_processes | awk -v a="$authority" 'index($0, a) { print "  PID " $1 ": " $3 }')" || true
+    fi
     if [[ -n "$others" ]]; then
         echo -e "${R}$(say '✗ Andere Borg-Prozesse arbeiten gerade mit diesem Repo:' '✗ Other borg processes are using this repo right now:')${NC}"
         echo "$others"
@@ -2269,9 +2281,108 @@ repair_repo() {
 }
 
 # -------------------- Live progress --------------------
-live_progress_view() {
-    ensure_logfile_writable
+# Bound reads by bytes first: old logs may contain hours of CR-only progress
+# on one physical line. tail -n alone would print that entire line.
+recent_log_lines() {
+    tail -c 32768 "$LOG_FILE" 2>/dev/null | tr '\r' '\n' | tail -n "${1:-20}"
+}
 
+worker_ssh_pids() {
+    local host
+    host="$(_host_from_repo "$REPO")"
+    [[ "$1" =~ ^[0-9]+$ && -n "$host" ]] || return 1
+    ps -eo pid=,ppid=,comm=,args= | awk -v worker="$1" -v h="$host" '
+        { parent[$1] = $2; if ($3 == "ssh" && index($0, h)) ssh[$1] = 1 }
+        END {
+            for (pid in ssh)
+                for (p = pid; p in parent && p > 1; p = parent[p])
+                    if (parent[p] == worker) { print pid; break }
+        }'
+}
+
+# Only sockets belonging to this worker's SSH processes; another backup or an
+# unrelated SSH session must not count as evidence that this job progresses.
+worker_tcp_counters() {
+    local pids="$1"
+    ss -tinp 2>/dev/null | awk -v pids="$pids" '
+        BEGIN { n = split(pids, ids, /[[:space:]]+/) }
+        /^[^[:space:]]/ {
+            active = 0
+            for (i = 1; i <= n; i++)
+                if (ids[i] != "" && index($0, "pid=" ids[i] ",")) active = 1
+            next
+        }
+        active {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^bytes_acked:/) { split($i, a, ":"); acked += a[2]; count++ }
+                if ($i ~ /^bytes_retrans:/) { split($i, a, ":"); retrans += a[2] }
+            }
+            active = 0
+        }
+        END { if (count) printf "%.0f %.0f %d\n", acked, retrans, count; else exit 1 }'
+}
+
+diagnose_job() {
+    echo "$(say 'Job-Diagnose (nur lesend)' 'Job diagnostics (read only)')"
+    echo "$(get_job_status_formatted)"
+    echo "Log: $LOG_FILE"
+    if [[ -r "$LOG_FILE" ]]; then
+        local modified
+        modified="$(stat -c %Y "$LOG_FILE" 2>/dev/null || date +%s)"
+        echo "$(say 'Letztes Log-Update vor' 'Last log update'): $(( $(date +%s) - modified ))s"
+        recent_log_lines 8
+    fi
+    if ! is_running; then
+        echo "$(say 'Aktuell läuft kein Job.' 'No job is currently running.')"
+        return 0
+    fi
+    local pid pids before after ack1 ret1 count1 ack2 ret2 count2 started elapsed
+    pid="$(read_pid)"
+    echo "PID: $pid"
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "$(say 'TCP-Diagnose benötigt ss (iproute2).' 'TCP diagnostics require ss (iproute2).')"
+        return 0
+    fi
+    pids="$(worker_ssh_pids "$pid")" || pids=""
+    if [[ -z "$pids" ]] || ! before="$(worker_tcp_counters "$pids")"; then
+        echo "$(say 'Keine sichtbare SSH-Verbindung für diesen Job. Bei einem sudo-Job auch die Diagnose mit sudo starten.' \
+                    'No visible SSH connection for this job. For a sudo job, run diagnostics with sudo too.')"
+        return 0
+    fi
+    read -r ack1 ret1 count1 <<< "$before"
+    echo "$(say 'Messe bestätigte SSH-Daten für 3 Sekunden...' 'Measuring acknowledged SSH data for 3 seconds...')"
+    started=$SECONDS
+    sleep 3
+    elapsed=$(( SECONDS - started ))
+    (( elapsed > 0 )) || elapsed=1
+    if ! after="$(worker_tcp_counters "$pids")"; then
+        echo "$(say 'SSH-Verbindung inzwischen beendet; Status/Log erneut prüfen.' 'SSH connection ended; check status/log again.')"
+        return 0
+    fi
+    read -r ack2 ret2 count2 <<< "$after"
+    if (( ack2 < ack1 || ret2 < ret1 || count1 != count2 )); then
+        echo "$(say 'SSH-Verbindung hat gewechselt; Diagnose erneut starten.' 'SSH connection changed; run diagnostics again.')"
+        return 0
+    fi
+    echo "$(say 'In diesen SSH-Verbindungen bestätigt' 'Acknowledged in these SSH connections'): $(human_bytes "$ack2")"
+    local rate
+    rate=$(( (ack2 - ack1) / elapsed ))
+    echo "$(say 'Aktuelle Übertragungsrate' 'Current transfer rate'): $(human_bytes "$rate")/s"
+    echo "$(say 'Erneut gesendete TCP-Daten im Messfenster' 'TCP data retransmitted during sample'): $(human_bytes "$(( ret2 - ret1 ))")"
+    if (( ack2 > ack1 )); then
+        echo "$(say 'Daten werden übertragen. Eine lange Laufzeit allein bedeutet keinen Stillstand.' \
+                    'Data is being transferred. A long runtime alone does not mean the job is stuck.')"
+        if (( rate < 1048576 )); then
+            echo "$(say 'Verbindung langsam: WLAN/LAN und Internet-Uplink prüfen; große Images können so Tage benötigen.' \
+                        'Connection is slow: check Wi-Fi/Ethernet and the internet uplink; large images can take days at this rate.')"
+        fi
+    else
+        echo "$(say 'Im Messfenster keine Daten bestätigt. Borg kann lokal lesen oder Caches verarbeiten; später erneut messen.' \
+                    'No data acknowledged during the sample. Borg may be reading locally or processing caches; measure again later.')"
+    fi
+}
+
+live_progress_view() {
     local key=""
     local was_running=0
     is_running && was_running=1
@@ -2296,7 +2407,7 @@ live_progress_view() {
         echo ""
 
         if [[ -f "$LOG_FILE" ]]; then
-            tail -n 60 "$LOG_FILE" | tr '\r' '\n'
+            recent_log_lines 60
         else
             echo "$(say 'Noch kein Log vorhanden.' 'No log yet.')"
         fi
@@ -2422,6 +2533,7 @@ show_menu() {
     echo -e "${C}10) $(say 'systemd User-Service/Timer installieren' 'Install systemd user service/timer')${NC}"
     echo -e "${C}11) $(say 'Repo-Lock brechen (borg break-lock)' 'Break repo lock (borg break-lock)')${NC}"
     echo -e "${C}12) $(say 'Repo prüfen & reparieren (borg check --repair)' 'Check & repair repo (borg check --repair)')${NC}"
+    echo -e "${C}d)  $(say 'Laufzeit/Übertragung diagnostizieren' 'Diagnose runtime/transfer')${NC}"
     if is_running; then
         echo -e "${Y}s)  $(say 'Laufenden Job stoppen' 'Stop running job')${NC}"
     fi
@@ -2480,7 +2592,7 @@ fi
 
 # Non-interactive CLI mode
 if [[ $# -gt 0 ]]; then
-    maybe_inhibit_exec "$@"
+    if [[ "$1" != "diagnose" ]]; then maybe_inhibit_exec "$@"; fi
 
     [[ -z "${UI_LANG:-}" ]] && UI_LANG="de"
 
@@ -2517,6 +2629,10 @@ if [[ $# -gt 0 ]]; then
             echo "$(get_job_status_formatted)"
             exit 0
             ;;
+        diagnose)
+            diagnose_job
+            exit 0
+            ;;
         stop)
             stop_running_job || exit 1
             exit 0
@@ -2529,6 +2645,7 @@ if [[ $# -gt 0 ]]; then
             echo "  $0 repair"
             echo "  $0 install-service"
             echo "  $0 status"
+            echo "  $0 diagnose"
             echo "  $0 stop"
             exit 2
             ;;
@@ -2728,6 +2845,10 @@ while true; do
             ;;
         12)
             repair_repo || true
+            pause
+            ;;
+        d|D)
+            diagnose_job
             pause
             ;;
         s|S)

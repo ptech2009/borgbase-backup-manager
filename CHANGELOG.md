@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v1.8.22 - 2026-10-28
+
+- Network recovery: image and directory uploads now share one bounded retry loop. Connection resets, timeouts, unreachable networks and DNS failures are recognized alongside broken pipes; authentication, disk-full and repository errors are not retried automatically.
+- Each upload attempt logs its start/end timestamp, duration and exit code. The job status explicitly shows the wait before a retry, and stopping during that wait cannot start another attempt. Failed progress/log pipelines cannot report a successful upload.
+- New menu option **d** and CLI command `borgbase_manager.sh diagnose`: recent log output, log age and a three-second sample of acknowledged SSH bytes, transfer rate and TCP retransmissions. Only SSH descendants of the recorded worker are counted. No repository connection, unlock or restart is performed; slow transfers are left running.
+- Progress is flushed through `stdbuf` when available. The live view reads a bounded log tail and splits carriage returns before selecting lines, avoiding stale-looking output and huge dumps from older logs. Opening the live view no longer touches the log timestamp.
+- Added isolated regression tests for reconnects, retry limits, permanent failures, manual stop, pipeline failures, log handling and TCP counters, plus real local Borg create/restore/check coverage in CI. Fixed existing ShellCheck findings; the established bilingual output style is documented in `.shellcheckrc`.
+
 ## v1.8.21 - 2026-10-05
 
 - New: menu option **12** (Check & repair repo) and `borgbase_manager.sh repair` run `borg check --repair` for a damaged repository, for example after two programs wrote into it at the same time. It refuses while a job runs or while another Borg process on this PC uses the repository, warns if Vorta is running, and asks you to type `REPAIR`. Step 1 repairs the repository (index and segments). Step 2 (optional, needs the passphrase) checks all archives and removes what cannot be recovered. The connection test runs again at the end. Sleep is blocked while it runs.
